@@ -1,4 +1,7 @@
 import type { AskRequest, AskResponse, EvalScores } from './types';
+import { tracer, setCommonSpanAttrs, markError } from './otel';
+import { m } from './metrics';
+import { performance } from 'perf_hooks';
 
 function clamp01(n: number) {
   return Math.max(0, Math.min(1, n));
@@ -66,24 +69,166 @@ function remediate(scores: EvalScores, toolFailed: boolean) {
 }
 
 export async function orchestrate(req: AskRequest): Promise<AskResponse> {
-  const rag = await mockRag(req.input, req.chaos?.badRag);
+  const start = performance.now();
 
+  m.requests.add(1, {
+    tenant: req.tenant ?? 'unknown',
+  });
+
+  return tracer.startActiveSpan('orchestrator.plan', (planSpan) => {
+    setCommonSpanAttrs(planSpan, {
+      'app.request_id': req.requestId,
+      'app.tenant': req.tenant ?? 'unknown',
+      'app.chaos': req.chaos ?? {},
+    });
+
+    return doOrchestrate(req, planSpan, start).finally(() => planSpan.end());
+  });
+}
+
+async function doOrchestrate(req: AskRequest, planSpan: any, start: number): Promise<AskResponse> {
+  // --- RAG span ---
+  const rag = await tracer.startActiveSpan('rag.retrieve', async (span) => {
+    try {
+      const t0 = performance.now();
+      const result = await mockRag(req.input, req.chaos?.badRag);
+      m.ragLatencyMs.record(performance.now() - t0, {
+        tenant: req.tenant ?? 'unknown',
+        bad_rag: !!req.chaos?.badRag,
+      });
+      setCommonSpanAttrs(span, {
+        'rag.docs': result.docs,
+        'rag.bad': !!req.chaos?.badRag,
+      });
+      span.end();
+      return result;
+    } catch (e) {
+      markError(span, e);
+      span.end();
+      throw e;
+    }
+  });
+
+  // --- TOOL span ---
   let toolFailed = false;
-  try {
-    await mockToolCall(req.chaos?.breakTool);
-  } catch {
-    toolFailed = true;
-  }
+  await tracer.startActiveSpan('tool.call', async (span) => {
+    const t0 = performance.now();
+    try {
+      setCommonSpanAttrs(span, { 'tool.name': 'mock.weather' });
+      await mockToolCall(req.chaos?.breakTool);
+      m.toolLatencyMs.record(performance.now() - t0, {
+        tenant: req.tenant ?? 'unknown',
+        tool_name: 'mock.weather',
+        status: 'ok',
+      });
+      setCommonSpanAttrs(span, { 'tool.status': 'ok' });
+      span.end();
+    } catch (e) {
+      toolFailed = true;
+      m.toolErrors.add(1, {
+        tenant: req.tenant ?? 'unknown',
+        tool_name: 'mock.weather',
+        error_type: (e as any)?.code ?? 'UNKNOWN',
+      });
+      m.toolLatencyMs.record(performance.now() - t0, {
+        tenant: req.tenant ?? 'unknown',
+        tool_name: 'mock.weather',
+        status: 'error',
+      });
+      setCommonSpanAttrs(span, { 'tool.status': 'error', 'tool.error_type': (e as any)?.code ?? 'UNKNOWN' });
+      markError(span, e);
+      span.end();
+      // NOTE: do not throw - we want degraded-mode to continue
+    }
+  });
 
   const prompt = `User: ${req.input}\nContext: ${rag.context}`;
-  const llm = await mockLlmGenerate(prompt, req.chaos?.tokenSpike);
 
-  const scores = evaluate(llm.text, rag.context, req.chaos);
-  const remediationApplied = remediate(scores, toolFailed);
+  // --- LLM span ---
+  const llm = await tracer.startActiveSpan('llm.generate', async (span) => {
+    try {
+      setCommonSpanAttrs(span, {
+        'llm.provider': 'mock',
+        'llm.model': 'mock-gemini',
+        'llm.token_spike': !!req.chaos?.tokenSpike,
+      });
 
+      const t0 = performance.now();
+      const res = await mockLlmGenerate(prompt, req.chaos?.tokenSpike);
+      m.llmLatencyMs.record(performance.now() - t0, {
+        tenant: req.tenant ?? 'unknown',
+        model: res.modelName,
+      });
+      m.llmTotalTokens.record(res.totalTokens, {
+        tenant: req.tenant ?? 'unknown',
+        model: res.modelName,
+      });
+      m.llmCostUsdEstimate.record(res.costUsdEstimate, {
+        tenant: req.tenant ?? 'unknown',
+        model: res.modelName,
+      });
+
+      setCommonSpanAttrs(span, {
+        'llm.input_tokens': res.inputTokens,
+        'llm.output_tokens': res.outputTokens,
+        'llm.total_tokens': res.totalTokens,
+        'llm.cost_usd_estimate': res.costUsdEstimate,
+      });
+
+      span.end();
+      return res;
+    } catch (e) {
+      markError(span, e);
+      span.end();
+      throw e;
+    }
+  });
+
+  // --- EVAL span ---
+  const scores = tracer.startActiveSpan('evaluator.score', (span) => {
+    try {
+      const t0 = performance.now();
+      const s = evaluate(llm.text, rag.context, req.chaos);
+      m.evalLatencyMs.record(performance.now() - t0, { tenant: req.tenant ?? 'unknown' });
+      m.qualityFaithfulness.record(s.faithfulness, { tenant: req.tenant ?? 'unknown' });
+      m.qualityPolicyRisk.record(s.policyRisk, { tenant: req.tenant ?? 'unknown' });
+      if (s.hallucinationSuspected === 1) {
+        m.qualityHallucination.add(1, { tenant: req.tenant ?? 'unknown' });
+      }
+      setCommonSpanAttrs(span, {
+        'eval.faithfulness': s.faithfulness,
+        'eval.relevance': s.relevance,
+        'eval.policy_risk': s.policyRisk,
+        'eval.format_ok': s.formatCompliance,
+        'eval.hallucination': s.hallucinationSuspected,
+      });
+      span.end();
+      return s;
+    } catch (e) {
+      markError(span, e);
+      span.end();
+      throw e;
+    }
+  });
+
+  // --- REMEDIATION span ---
+  const remediationApplied = tracer.startActiveSpan('remediation.apply', (span) => {
+    const action = remediate(scores, toolFailed);
+    setCommonSpanAttrs(span, {
+      'remediation.action': action ?? 'NONE',
+      'remediation.tool_failed': toolFailed,
+    });
+    span.end();
+    return action;
+  });
+
+  // Remediation counters
+  if (remediationApplied === 'FALLBACK_TOOL') m.fallbackTriggered.add(1, { tenant: req.tenant ?? 'unknown' });
+  if (remediationApplied === 'SAFE_MODE') m.safeModeTriggered.add(1, { tenant: req.tenant ?? 'unknown' });
+  if (remediationApplied === 'ASK_CLARIFY') m.askClarifyTriggered.add(1, { tenant: req.tenant ?? 'unknown' });
+
+  // Apply remediation
   let answer = llm.text;
-
-  // Apply remediation result deterministically
   if (remediationApplied === 'SAFE_MODE') {
     answer = `Safe mode: I can't help with that request. Please rephrase or provide a safer alternative.`;
   } else if (remediationApplied === 'FALLBACK_TOOL') {
@@ -91,6 +236,19 @@ export async function orchestrate(req: AskRequest): Promise<AskResponse> {
   } else if (remediationApplied === 'ASK_CLARIFY') {
     answer = `I might be missing context. Can you clarify what exactly you mean by: "${req.input}"?`;
   }
+
+  // add a final summary into the plan span
+  setCommonSpanAttrs(planSpan, {
+    'result.remediation': remediationApplied ?? 'NONE',
+    'result.risk_level': scores.policyRisk > 0.7 ? 'high' : scores.policyRisk > 0.3 ? 'medium' : 'low',
+    'result.hallucination': scores.hallucinationSuspected,
+  });
+
+  // End-to-end latency
+  m.endToEndLatencyMs.record(performance.now() - start, {
+    tenant: req.tenant ?? 'unknown',
+    remediation: remediationApplied ?? 'NONE',
+  });
 
   return {
     requestId: req.requestId,
