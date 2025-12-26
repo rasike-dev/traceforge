@@ -32,6 +32,10 @@ export const m = {
     unit: 'ms',
   }),
 
+  toolCalls: meter.createCounter('traceforge.tool.calls', {
+    description: 'Total tool calls (successful)',
+  }),
+
   toolErrors: meter.createCounter('traceforge.tool.errors', {
     description: 'Tool call errors',
   }),
