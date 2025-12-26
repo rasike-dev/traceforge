@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { orchestrate } from '@traceforge/core';
 import { randomUUID } from 'crypto';
+import type { AskRequest } from '@traceforge/core';
 
 type HandleInput = {
   input: string;
@@ -15,13 +16,18 @@ type HandleInput = {
 
 @Injectable()
 export class AskService {
-  async handle(input: HandleInput) {
-    return orchestrate({
-      requestId: randomUUID(),
-      input: input.input,
-      tenant: input.tenant,
+  async handle(input: HandleInput): Promise<ReturnType<typeof orchestrate>> {
+    const requestId = randomUUID();
+    const tenantId = input.tenant ?? 'unknown';
+    
+    const askRequest: AskRequest = {
+      requestId,
+      tenantId,
+      input: { text: input.input },
       chaos: input.chaos,
-    });
+    };
+    
+    return orchestrate(askRequest);
   }
 }
 

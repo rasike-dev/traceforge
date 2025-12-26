@@ -1,8 +1,11 @@
-import type { AskRequest, AskResponse, EvalScores } from './types';
-import { tracer, setCommonSpanAttrs, markError } from './otel';
+import type { AskRequest, AskResponse, EvalScores, RemediationReport } from './types';
+import { setCommonSpanAttrs } from './otel';
 import { m } from './metrics';
 import { performance } from 'perf_hooks';
-import { trace, SpanStatusCode, SpanKind } from '@opentelemetry/api';
+import { trace, SpanKind, Span } from '@opentelemetry/api';
+import { startStageSpan, startStageSpanSync, SPAN_NAMES } from '@traceforge/telemetry';
+import type { StageSpanContext } from '@traceforge/telemetry';
+import { classifyError, determineFinalStatus, type ErrorClassification, type RequestStatus } from './error-taxonomy';
 
 function clamp01(n: number) {
   return Math.max(0, Math.min(1, n));
@@ -46,293 +49,502 @@ function evaluate(answer: string, context: string, flags?: AskRequest['chaos']):
   // Rule-based mock scoring (fast + deterministic)
   const relevance = context.includes('relevant') ? 0.9 : 0.3;
   const faithfulness = context.includes('relevant') ? 0.88 : 0.45;
-
   const policyRisk = flags?.policyRisk ? 0.9 : 0.1;
+  const hallucination = faithfulness < 0.7 ? 0.8 : 0.1; // Convert to 0..1 scale
   const formatCompliance: 0 | 1 = answer.length > 0 ? 1 : 0;
 
-  // "hallucination suspected" when faithfulness low
-  const hallucinationSuspected: 0 | 1 = faithfulness < 0.7 ? 1 : 0;
+  // Calculate overall score (weighted average)
+  const overall = (faithfulness * 0.3 + relevance * 0.3 + (1 - policyRisk) * 0.2 + (1 - hallucination) * 0.2);
+
+  const reasons: string[] = [];
+  if (faithfulness < 0.7) reasons.push('Low faithfulness detected');
+  if (relevance < 0.5) reasons.push('Low relevance to context');
+  if (policyRisk > 0.7) reasons.push('High policy risk detected');
+  if (hallucination > 0.5) reasons.push('Potential hallucination');
 
   return {
     faithfulness: clamp01(faithfulness),
     relevance: clamp01(relevance),
     policyRisk: clamp01(policyRisk),
+    hallucination: clamp01(hallucination),
+    overall: clamp01(overall),
+    reasons: reasons.length > 0 ? reasons : undefined,
     formatCompliance,
-    hallucinationSuspected,
   };
 }
 
-function remediate(scores: EvalScores, toolFailed: boolean) {
-  if (scores.policyRisk > 0.7) return 'SAFE_MODE';
-  if (toolFailed) return 'FALLBACK_TOOL';
-  if (scores.faithfulness < 0.8) return 'ASK_CLARIFY';
-  return undefined;
+function remediate(scores: EvalScores, toolFailed: boolean): RemediationReport {
+  const actions: RemediationReport['actions'] = [];
+  let finalMode: RemediationReport['finalMode'] = 'NORMAL';
+
+  if (scores.policyRisk > 0.7) {
+    actions.push({ type: 'SAFE_MODE', reason: 'Policy risk threshold exceeded' });
+    finalMode = 'SAFE';
+  } else if (toolFailed) {
+    actions.push({ type: 'FALLBACK_TOOL', reason: 'Tool execution failed' });
+    finalMode = 'DEGRADED';
+  } else if (scores.faithfulness < 0.8) {
+    actions.push({ type: 'CLARIFICATION', reason: 'Low faithfulness score' });
+    finalMode = 'DEGRADED';
+  }
+
+  return {
+    triggered: actions.length > 0,
+    actions,
+    finalMode,
+  };
 }
 
 export async function orchestrate(req: AskRequest): Promise<AskResponse> {
   const start = performance.now();
 
-  m.requests.add(1, {
-    tenant: req.tenant ?? 'unknown',
-  });
+  // Note: requestCount will be incremented at the end with final status
 
-  return tracer.startActiveSpan('orchestrator.plan', (planSpan) => {
-    try {
-      // Set llm_stage inside startActiveSpan callback (required for Datadog metrics)
-      planSpan.setAttribute('llm_stage', 'orchestrator.plan');
-      setCommonSpanAttrs(planSpan, {
-        'app.request_id': req.requestId,
-        'app.tenant': req.tenant ?? 'unknown',
-        'app.chaos': req.chaos ?? {},
-      });
+  // Root span: traceforge.request (wraps entire orchestration)
+  return startStageSpan(
+    {
+      requestId: req.requestId,
+      tenantId: req.tenantId,
+      stage: 'request',
+      stageAttrs: {}, // Request span has no required stage-specific attrs
+    },
+    async (span: Span, ctx: StageSpanContext & { updateStatus: (status: RequestStatus) => void }) => {
+      // Keep llm_stage for backward compatibility (can remove later)
+      span.setAttribute('llm_stage', 'request');
 
-      return doOrchestrate(req, planSpan, start);
-    } catch (err) {
-      planSpan.recordException(err as Error);
-      planSpan.setStatus({ code: SpanStatusCode.ERROR });
-      throw err;
-    } finally {
-      planSpan.end();
+      return await doOrchestrate(req, span, start, ctx);
     }
-  });
+  );
 }
 
-async function doOrchestrate(req: AskRequest, planSpan: any, start: number): Promise<AskResponse> {
-  // --- RAG span ---
-  // Use SpanKind.CLIENT so Datadog counts it for trace.span.errors
-  // INTERNAL spans are often excluded from error stats
-  const rag = await tracer.startActiveSpan('rag.retrieve', { kind: SpanKind.CLIENT }, async (span) => {
-    try {
-      // Set llm_stage inside startActiveSpan callback (required for Datadog metrics)
-      span.setAttribute('llm_stage', 'rag.retrieve');
+async function doOrchestrate(
+  req: AskRequest,
+  requestSpan: any,
+  start: number,
+  requestCtx: { updateStatus: (status: RequestStatus) => void }
+): Promise<AskResponse> {
+  // Track stage errors for final status determination
+  const stageErrors: Array<{ stage: string; error: ErrorClassification | null }> = [];
+  // --- RAG span: traceforge.rag ---
+  const rag = await startStageSpan(
+    {
+      requestId: req.requestId,
+      tenantId: req.tenantId,
+      stage: 'rag',
+      kind: SpanKind.CLIENT,
+      stageAttrs: {
+        'rag.provider': 'mock',
+        'rag.top_k': 3,
+        'rag.docs.count': 0, // Will be updated after result
+        'rag.query.length': req.input.text.length,
+      },
+    },
+    async (span: Span, ctx: StageSpanContext & { updateStatus: (status: 'OK' | 'ERROR' | 'DEGRADED') => void }) => {
       const t0 = performance.now();
-      const result = await mockRag(req.input, req.chaos?.badRag);
-      m.ragLatencyMs.record(performance.now() - t0, {
-        tenant: req.tenant ?? 'unknown',
-        bad_rag: !!req.chaos?.badRag,
-      });
+      
+      // Keep llm_stage for backward compatibility
+      span.setAttribute('llm_stage', 'rag.retrieve');
+      
+      const result = await mockRag(req.input.text, req.chaos?.badRag);
+      
+      // Update stage-specific attributes with actual values
       setCommonSpanAttrs(span, {
-        'rag.docs': result.docs,
-        'rag.bad': !!req.chaos?.badRag,
+        'rag.docs.count': result.docs,
       });
       
-      // Step 4B: Force ONE controlled error for observability test
-      // This ensures trace.span.errors increments in Datadog
-      const forcedError = new Error('forced error for observability test');
-      span.recordException(forcedError);
-      span.setStatus({ code: SpanStatusCode.ERROR, message: 'forced error for observability test' });
+      m.ragLatencyMs.record(performance.now() - t0, {
+        tenant_id: req.tenantId,
+        rag_provider: 'mock',
+      });
       
-      span.end();
+      // Record RAG docs count (gauge-like)
+      m.ragDocsCount.add(result.docs, {
+        tenant_id: req.tenantId,
+        rag_provider: 'mock',
+      });
+      
+      // Empty docs is not an error - status stays OK
+      if (result.docs === 0) {
+        // Not an error, just empty result
+        stageErrors.push({ stage: 'rag', error: null });
+      } else {
+        stageErrors.push({ stage: 'rag', error: null });
+      }
+      
+      // Force error for observability test (temporary) - remove this later
+      const forcedError = new Error('forced error for observability test');
+      const errorClass = classifyError('rag', forcedError, { providerDown: true });
+      span.setAttribute('error.type', errorClass.type);
+      span.setAttribute('error.code', errorClass.code);
+      span.setAttribute('error.message', errorClass.message);
+      span.recordException(forcedError);
+      span.setStatus({ code: 2, message: errorClass.message }); // SpanStatusCode.ERROR = 2
+      ctx.updateStatus('ERROR');
+      stageErrors.push({ stage: 'rag', error: errorClass });
+      
       return result;
-    } catch (e) {
-      markError(span, e);
-      span.end();
-      throw e;
     }
-  });
+  );
 
-  // --- TOOL span ---
+  // --- TOOL span: traceforge.tool (repeatable) ---
   let toolFailed = false;
   const toolName = 'mock.weather';
-  await tracer.startActiveSpan('tool.call', async (span) => {
-    const t0 = performance.now();
-    try {
-      // Set attributes inside startActiveSpan callback (required for Datadog metrics)
-      span.setAttribute('tool.name', toolName);
-      span.setAttribute('tool_name', toolName);
-      span.setAttribute('llm_stage', 'tool.call');
-      await mockToolCall(req.chaos?.breakTool);
-      // Emit tool call success metric (env/service inherited from resource attributes)
-      m.toolCalls.add(1, {
-        tenant: req.tenant ?? 'unknown',
-        tool_name: toolName,
-      });
-      m.toolLatencyMs.record(performance.now() - t0, {
-        tenant: req.tenant ?? 'unknown',
-        tool_name: toolName,
-        status: 'ok',
-      });
-      // Set tool.status to "ok" on success
-      span.setAttribute('tool.status', 'ok');
-      // Update root span with tool name
-      const rootSpan = trace.getActiveSpan();
-      rootSpan?.setAttribute('tool_name', toolName);
-      span.end();
-    } catch (e) {
-      toolFailed = true;
-      m.toolErrors.add(1, {
-        tenant: req.tenant ?? 'unknown',
-        tool_name: toolName,
-        error_type: (e as any)?.code ?? 'UNKNOWN',
-      });
-      m.toolLatencyMs.record(performance.now() - t0, {
-        tenant: req.tenant ?? 'unknown',
-        tool_name: toolName,
-        status: 'error',
-      });
-      // Set tool.status to "error" on error
-      span.setAttribute('tool.status', 'error');
-      // Record exception and set span status to ERROR
-      span.recordException(e as Error);
-      span.setStatus({ code: SpanStatusCode.ERROR, message: (e as any)?.message ?? 'tool error' });
-      // Update root span with tool name even on error
-      const rootSpan = trace.getActiveSpan();
-      rootSpan?.setAttribute('tool_name', toolName);
-      span.end();
-      // NOTE: do not throw - we want degraded-mode to continue
-    }
-  });
+  const toolAttempt = 1;
+  const toolTimeoutMs = 5000;
+  const toolT0 = performance.now();
+  
+  try {
+    await startStageSpan(
+      {
+        requestId: req.requestId,
+        tenantId: req.tenantId,
+        stage: 'tool',
+        stageAttrs: {
+          'tool.name': toolName,
+          'tool.attempt': toolAttempt,
+          'tool.timeout_ms': toolTimeoutMs,
+          'tool.result': 'SUCCESS',
+        },
+      },
+      async (span: Span, ctx: StageSpanContext & { updateStatus: (status: RequestStatus) => void }) => {
+        // Keep llm_stage for backward compatibility
+        span.setAttribute('llm_stage', 'tool.call');
+        
+        await mockToolCall(req.chaos?.breakTool);
+        
+        // Emit tool call success metric
+        m.toolCalls.add(1, {
+          tenant_id: req.tenantId,
+          tool_name: toolName,
+        });
+        m.toolLatencyMs.record(performance.now() - toolT0, {
+          tenant_id: req.tenantId,
+          tool_name: toolName,
+          result: 'SUCCESS',
+        });
+        
+        // Update root span with tool name
+        requestSpan.setAttribute('tool_name', toolName);
+      }
+    );
+  } catch (e) {
+    toolFailed = true;
+    const err = e as any;
+    
+    // Classify the error using taxonomy
+    const errorClass = classifyError('tool', e, { timeout: err?.code === 'TOOL_TIMEOUT' });
+    
+    // Create error span manually to set error taxonomy attributes
+    await startStageSpan(
+      {
+        requestId: req.requestId,
+        tenantId: req.tenantId,
+        stage: 'tool',
+        stageAttrs: {
+          'tool.name': toolName,
+          'tool.attempt': toolAttempt,
+          'tool.timeout_ms': toolTimeoutMs,
+          'tool.result': 'FAILURE',
+        },
+      },
+      async (span: Span, ctx: StageSpanContext & { updateStatus: (status: RequestStatus) => void }) => {
+        // Keep llm_stage for backward compatibility
+        span.setAttribute('llm_stage', 'tool.call');
+        
+        // Set error taxonomy attributes
+        span.setAttribute('error.type', errorClass.type);
+        span.setAttribute('error.code', errorClass.code);
+        span.setAttribute('error.message', errorClass.message);
+        span.recordException(e as Error);
+        span.setStatus({ code: 2, message: errorClass.message }); // SpanStatusCode.ERROR = 2
+        ctx.updateStatus('ERROR');
+        
+        // Record error metrics with error_type tag
+        m.toolErrors.add(1, {
+          tenant_id: req.tenantId,
+          tool_name: toolName,
+          error_type: errorClass.type,
+        });
+        
+        // Record tool latency on error
+        m.toolLatencyMs.record(performance.now() - toolT0, {
+          tenant_id: req.tenantId,
+          tool_name: toolName,
+          result: 'FAILURE',
+        });
+        
+        // Update root span with tool name even on error
+        requestSpan.setAttribute('tool_name', toolName);
+      }
+    );
+    
+    // Track stage error
+    stageErrors.push({ stage: 'tool', error: errorClass });
+    // NOTE: do not throw - we want degraded-mode to continue
+  }
 
-  const prompt = `User: ${req.input}\nContext: ${rag.context}`;
+  const prompt = `User: ${req.input.text}\nContext: ${rag.context}`;
 
-  // --- LLM span ---
-  const llm = await tracer.startActiveSpan('llm.generate', async (span) => {
-    try {
-      // Set llm_stage inside startActiveSpan callback (required for Datadog metrics)
-      span.setAttribute('llm_stage', 'llm.generate');
-      setCommonSpanAttrs(span, {
+  // --- LLM span: traceforge.llm ---
+  const llm = await startStageSpan(
+    {
+      requestId: req.requestId,
+      tenantId: req.tenantId,
+      stage: 'llm',
+      stageAttrs: {
         'llm.provider': 'mock',
-        'llm.model': 'mock-gemini',
-        'llm.token_spike': !!req.chaos?.tokenSpike,
-      });
-
+        'llm.model': 'mock-gemini', // Will be updated after result
+        'llm.tokens.input': 0, // Will be updated after result
+        'llm.tokens.output': 0, // Will be updated after result
+        'llm.tokens.total': 0, // Will be updated after result
+        'llm.cost.usd': 0, // Will be updated after result
+      },
+    },
+    async (span: Span, ctx: StageSpanContext & { updateStatus: (status: 'OK' | 'ERROR' | 'DEGRADED') => void }) => {
       const t0 = performance.now();
+      
+      // Keep llm_stage for backward compatibility
+      span.setAttribute('llm_stage', 'llm.generate');
+      
       const res = await mockLlmGenerate(prompt, req.chaos?.tokenSpike);
+      
+      // Update stage-specific attributes with actual values
+      setCommonSpanAttrs(span, {
+        'llm.model': res.modelName,
+        'llm.tokens.input': res.inputTokens,
+        'llm.tokens.output': res.outputTokens,
+        'llm.tokens.total': res.totalTokens,
+        'llm.cost.usd': res.costUsdEstimate,
+      });
       
       // Record latency metric
       m.llmLatencyMs.record(performance.now() - t0, {
-        tenant: req.tenant ?? 'unknown',
-        model: res.modelName,
-      });
-
-      // Set span attributes (for traces - filtering, debugging, trace drill-down)
-      setCommonSpanAttrs(span, {
-        'model': res.modelName,
-        'llm.prompt_tokens': res.inputTokens,
-        'llm.completion_tokens': res.outputTokens,
-        'llm.total_tokens': res.totalTokens,
-        'llm.cost_usd_estimate': res.costUsdEstimate,
+        tenant_id: req.tenantId,
+        llm_provider: 'mock',
+        llm_model: res.modelName,
       });
 
       // Emit metrics (for dashboards, trends, alerts)
-      m.llmTotalTokens.record(res.totalTokens, {
-        tenant: req.tenant ?? 'unknown',
-        model: res.modelName,
+      m.llmTokensInput.add(res.inputTokens, {
+        tenant_id: req.tenantId,
+        llm_provider: 'mock',
+        llm_model: res.modelName,
       });
-      m.llmCostUsdEstimate.record(res.costUsdEstimate, {
-        tenant: req.tenant ?? 'unknown',
-        model: res.modelName,
+      m.llmTokensOutput.add(res.outputTokens, {
+        tenant_id: req.tenantId,
+        llm_provider: 'mock',
+        llm_model: res.modelName,
+      });
+      m.llmCostUsd.add(res.costUsdEstimate, {
+        tenant_id: req.tenantId,
+        llm_provider: 'mock',
+        llm_model: res.modelName,
       });
 
       // Update root span with model name
-      const rootSpan = trace.getActiveSpan();
-      rootSpan?.setAttribute('model', res.modelName);
+      requestSpan.setAttribute('model', res.modelName);
 
-      span.end();
       return res;
-    } catch (e) {
-      markError(span, e);
-      span.end();
-      throw e;
     }
-  });
+  );
 
-  // --- EVAL span ---
-  const scores = tracer.startActiveSpan('evaluator.score', (span) => {
-    try {
-      // Set llm_stage inside startActiveSpan callback (required for Datadog metrics)
-      span.setAttribute('llm_stage', 'evaluator.score');
+  // --- EVALUATION span: traceforge.evaluation ---
+  const scores = startStageSpanSync(
+    {
+      requestId: req.requestId,
+      tenantId: req.tenantId,
+      stage: 'evaluation',
+      stageAttrs: {
+        'eval.faithfulness': 0, // Will be updated after evaluation
+        'eval.relevance': 0, // Will be updated after evaluation
+        'eval.policy_risk': 0, // Will be updated after evaluation
+        'eval.hallucination': 0, // Will be updated after evaluation
+        'eval.overall': 0, // Will be updated after evaluation
+      },
+    },
+    (span: Span, ctx: StageSpanContext & { updateStatus: (status: RequestStatus) => void }) => {
       const t0 = performance.now();
+      
+      // Keep llm_stage for backward compatibility
+      span.setAttribute('llm_stage', 'evaluator.score');
+      
       const s = evaluate(llm.text, rag.context, req.chaos);
-      m.evalLatencyMs.record(performance.now() - t0, { tenant: req.tenant ?? 'unknown' });
-      m.qualityFaithfulness.record(s.faithfulness, { tenant: req.tenant ?? 'unknown' });
-      m.qualityPolicyRisk.record(s.policyRisk, { tenant: req.tenant ?? 'unknown' });
-      if (s.hallucinationSuspected === 1) {
-        m.qualityHallucination.add(1, { tenant: req.tenant ?? 'unknown' });
-      }
+      
+      // Update stage-specific attributes with actual values
       setCommonSpanAttrs(span, {
         'eval.faithfulness': s.faithfulness,
         'eval.relevance': s.relevance,
         'eval.policy_risk': s.policyRisk,
-        'eval.format_ok': s.formatCompliance,
-        'eval.hallucination': s.hallucinationSuspected,
+        'eval.hallucination': s.hallucination,
+        'eval.overall': s.overall,
       });
-      span.end();
+      
+      // Record evaluation scores using single metric with dimension tag
+      m.evalScore.add(s.faithfulness, {
+        tenant_id: req.tenantId,
+        dimension: 'faithfulness',
+      });
+      m.evalScore.add(s.relevance, {
+        tenant_id: req.tenantId,
+        dimension: 'relevance',
+      });
+      m.evalScore.add(s.policyRisk, {
+        tenant_id: req.tenantId,
+        dimension: 'policy_risk',
+      });
+      m.evalScore.add(s.hallucination, {
+        tenant_id: req.tenantId,
+        dimension: 'hallucination',
+      });
+      m.evalScore.add(s.overall, {
+        tenant_id: req.tenantId,
+        dimension: 'overall',
+      });
+      
       return s;
-    } catch (e) {
-      markError(span, e);
-      span.end();
-      throw e;
     }
-  });
+  );
 
-  // --- REMEDIATION span ---
-  const remediationApplied = tracer.startActiveSpan('remediation.apply', (span) => {
-    try {
-      // Set llm_stage inside startActiveSpan callback (required for Datadog metrics)
+  // --- REMEDIATION span: traceforge.remediation ---
+  const remediationApplied = startStageSpanSync(
+    {
+      requestId: req.requestId,
+      tenantId: req.tenantId,
+      stage: 'remediation',
+      stageAttrs: {
+        'remediation.triggered': false, // Will be updated after remediation
+        'remediation.action': 'NONE', // Will be updated after remediation
+        'remediation.reason': 'No remediation needed', // Will be updated after remediation
+      },
+    },
+    (span: Span, ctx: StageSpanContext & { updateStatus: (status: RequestStatus) => void }) => {
+      // Keep llm_stage for backward compatibility
       span.setAttribute('llm_stage', 'remediation.apply');
+      
       const action = remediate(scores, toolFailed);
+      
+      // Determine status based on final mode
+      if (action.finalMode === 'DEGRADED') ctx.updateStatus('DEGRADED');
+      else if (action.finalMode === 'SAFE') ctx.updateStatus('DEGRADED'); // SAFE is a form of degradation
+      
+      // Stage-specific attributes
+      const remediationAction = action.actions.length > 0 ? action.actions[0].type : 'NONE';
+      const remediationReason = action.actions.length > 0 ? action.actions[0].reason : 'No remediation needed';
+      
       setCommonSpanAttrs(span, {
-        'remediation.action': action ?? 'NONE',
-        'remediation.tool_failed': toolFailed,
+        'remediation.triggered': action.triggered,
+        'remediation.action': remediationAction,
+        'remediation.reason': remediationReason,
       });
+      
+      // Add span events for remediation actions
+      if (action.triggered) {
+        for (const act of action.actions) {
+          if (act.type === 'FALLBACK_TOOL') {
+            span.addEvent('tool.fallback', {
+              reason: act.reason,
+              action: act.type,
+            });
+          } else if (act.type === 'SAFE_MODE') {
+            span.addEvent('remediation.safe_mode', {
+              reason: act.reason,
+              action: act.type,
+            });
+          } else if (act.type === 'CLARIFICATION') {
+            span.addEvent('remediation.clarification', {
+              reason: act.reason,
+              action: act.type,
+            });
+          }
+        }
+      }
+      
       return action;
-    } catch (err) {
-      span.recordException(err as Error);
-      span.setStatus({ code: SpanStatusCode.ERROR });
-      throw err;
-    } finally {
-      span.end();
     }
-  });
+  );
 
-  // Remediation counters
-  if (remediationApplied === 'FALLBACK_TOOL') m.fallbackTriggered.add(1, { tenant: req.tenant ?? 'unknown' });
-  if (remediationApplied === 'SAFE_MODE') m.safeModeTriggered.add(1, { tenant: req.tenant ?? 'unknown' });
-  if (remediationApplied === 'ASK_CLARIFY') m.askClarifyTriggered.add(1, { tenant: req.tenant ?? 'unknown' });
+  // Remediation counters - use single metric with action tag
+  if (remediationApplied.triggered) {
+    for (const action of remediationApplied.actions) {
+      m.remediationTriggered.add(1, {
+        tenant_id: req.tenantId,
+        action: action.type,
+      });
+    }
+  }
 
-  // Update root span with remediation
-  const rootSpan = trace.getActiveSpan();
-  const remediationTag = remediationApplied === 'FALLBACK_TOOL' ? 'fallback_tool' : 
-                         remediationApplied === 'SAFE_MODE' ? 'safe_mode' :
-                         remediationApplied === 'ASK_CLARIFY' ? 'ask_clarify' : 'none';
-  rootSpan?.setAttribute('remediation', remediationTag);
+  // Determine final status using error taxonomy
+  const hasUsableResponse = true; // We always produce a response (even if degraded)
+  const remediationSucceeded = remediationApplied.triggered && remediationApplied.finalMode !== 'NORMAL';
+  const finalStatus = determineFinalStatus(
+    stageErrors,
+    remediationApplied.triggered,
+    remediationSucceeded,
+    hasUsableResponse
+  );
+  
+  // Update root span with final status and error info
+  requestCtx.updateStatus(finalStatus);
+  
+  // Set error attributes on root span if there were errors
+  const dominantError = stageErrors.find(e => e.error !== null)?.error;
+  if (dominantError) {
+    requestSpan.setAttribute('traceforge.error.type', dominantError.type);
+    requestSpan.setAttribute('traceforge.error.code', dominantError.code);
+  }
+  
+  const remediationTag = remediationApplied.finalMode === 'DEGRADED' ? 'degraded' : 
+                         remediationApplied.finalMode === 'SAFE' ? 'safe_mode' : 'normal';
+  requestSpan.setAttribute('remediation', remediationTag);
 
   // Apply remediation
   let answer = llm.text;
-  if (remediationApplied === 'SAFE_MODE') {
+  if (remediationApplied.finalMode === 'SAFE') {
     answer = `Safe mode: I can't help with that request. Please rephrase or provide a safer alternative.`;
-  } else if (remediationApplied === 'FALLBACK_TOOL') {
-    answer = `${answer}\n\n(Note: tool degraded; returned fallback response.)`;
-  } else if (remediationApplied === 'ASK_CLARIFY') {
-    answer = `I might be missing context. Can you clarify what exactly you mean by: "${req.input}"?`;
+      } else if (remediationApplied.finalMode === 'DEGRADED' && remediationApplied.actions.some((a: { type: string }) => a.type === 'FALLBACK_TOOL')) {
+        answer = `${answer}\n\n(Note: tool degraded; returned fallback response.)`;
+      } else if (remediationApplied.finalMode === 'DEGRADED' && remediationApplied.actions.some((a: { type: string }) => a.type === 'CLARIFICATION')) {
+    answer = `I might be missing context. Can you clarify what exactly you mean by: "${req.input.text}"?`;
   }
 
-  // add a final summary into the plan span
-  setCommonSpanAttrs(planSpan, {
-    'result.remediation': remediationApplied ?? 'NONE',
+  // Add final summary to root span
+  setCommonSpanAttrs(requestSpan, {
+    'result.remediation': remediationApplied.finalMode,
     'result.risk_level': scores.policyRisk > 0.7 ? 'high' : scores.policyRisk > 0.3 ? 'medium' : 'low',
-    'result.hallucination': scores.hallucinationSuspected,
+    'result.hallucination': scores.hallucination > 0.5,
   });
 
-  // End-to-end latency
-  m.endToEndLatencyMs.record(performance.now() - start, {
-    tenant: req.tenant ?? 'unknown',
-    remediation: remediationApplied ?? 'NONE',
+  // End-to-end latency with final status
+  m.requestLatencyMs.record(performance.now() - start, {
+    tenant_id: req.tenantId,
+    status: finalStatus,
   });
+  
+  // Request count with status tag (moved here so we have final status)
+  m.requestCount.add(1, {
+    tenant_id: req.tenantId,
+    status: finalStatus,
+  });
+
+  // Get trace context for debug field
+  const activeSpan = trace.getActiveSpan();
+  const spanContext = activeSpan?.spanContext();
+  const traceId = spanContext?.traceId;
+  const spanId = spanContext?.spanId;
 
   return {
     requestId: req.requestId,
-    answer,
-    scores,
-    meta: {
-      modelName: llm.modelName,
-      inputTokens: llm.inputTokens,
-      outputTokens: llm.outputTokens,
+    tenantId: req.tenantId,
+    answer: { text: answer },
+    usage: {
+      tokensIn: llm.inputTokens,
+      tokensOut: llm.outputTokens,
       totalTokens: llm.totalTokens,
-      costUsdEstimate: llm.costUsdEstimate,
-      remediationApplied,
+      costUsd: llm.costUsdEstimate,
     },
+    eval: scores,
+    remediation: remediationApplied,
+    debug: traceId && spanId ? { traceId, spanId } : undefined,
   };
 }
 

@@ -135,6 +135,9 @@ importers:
       '@opentelemetry/api':
         specifier: ^1.9.0
         version: 1.9.0
+      '@traceforge/telemetry':
+        specifier: workspace:*
+        version: link:../telemetry
     devDependencies:
       '@types/node':
         specifier: ^22.19.3
