@@ -3,6 +3,15 @@
   "private": true,
   "version": "0.1.0",
   "main": "dist/index.js",
-  "types": "dist/index.d.ts"
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs --dts",
+    "dev": "tsup src/index.ts --format cjs --dts --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.3",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3"
+  }
 }
 

@@ -2,11 +2,12 @@ import type { AskRequest, AskResponse, EvalScores, RemediationReport } from './t
 import { setCommonSpanAttrs } from './otel';
 import { m } from './metrics';
 import { performance } from 'perf_hooks';
-import { trace, SpanKind, Span } from '@opentelemetry/api';
+import { trace, SpanKind, Span, SpanStatusCode } from '@opentelemetry/api';
 import { startStageSpan, startStageSpanSync, SPAN_NAMES } from '@traceforge/telemetry';
 import type { StageSpanContext } from '@traceforge/telemetry';
 import { classifyError, determineFinalStatus, type ErrorClassification, type RequestStatus } from './error-taxonomy';
 import { GeminiProvider } from '@traceforge/llm';
+import { basicEvaluate } from '@traceforge/evaluator';
 
 function clamp01(n: number) {
   return Math.max(0, Math.min(1, n));
@@ -47,33 +48,7 @@ function mapLLMErrorCode(err: any): string {
   return 'LLM_PROVIDER_DOWN';
 }
 
-function evaluate(answer: string, context: string, flags?: AskRequest['chaos']): EvalScores {
-  // Rule-based mock scoring (fast + deterministic)
-  const relevance = context.includes('relevant') ? 0.9 : 0.3;
-  const faithfulness = context.includes('relevant') ? 0.88 : 0.45;
-  const policyRisk = flags?.policyRisk ? 0.9 : 0.1;
-  const hallucination = faithfulness < 0.7 ? 0.8 : 0.1; // Convert to 0..1 scale
-  const formatCompliance: 0 | 1 = answer.length > 0 ? 1 : 0;
-
-  // Calculate overall score (weighted average)
-  const overall = (faithfulness * 0.3 + relevance * 0.3 + (1 - policyRisk) * 0.2 + (1 - hallucination) * 0.2);
-
-  const reasons: string[] = [];
-  if (faithfulness < 0.7) reasons.push('Low faithfulness detected');
-  if (relevance < 0.5) reasons.push('Low relevance to context');
-  if (policyRisk > 0.7) reasons.push('High policy risk detected');
-  if (hallucination > 0.5) reasons.push('Potential hallucination');
-
-  return {
-    faithfulness: clamp01(faithfulness),
-    relevance: clamp01(relevance),
-    policyRisk: clamp01(policyRisk),
-    hallucination: clamp01(hallucination),
-    overall: clamp01(overall),
-    reasons: reasons.length > 0 ? reasons : undefined,
-    formatCompliance,
-  };
-}
+// Removed evaluate() wrapper - now using basicEvaluate() directly in evaluation span
 
 function remediate(scores: EvalScores, toolFailed: boolean): RemediationReport {
   const actions: RemediationReport['actions'] = [];
@@ -412,61 +387,156 @@ async function doOrchestrate(
   );
 
   // --- EVALUATION span: traceforge.evaluation ---
-  const scores = startStageSpanSync(
-    {
-      requestId: req.requestId,
-      tenantId: req.tenantId,
-      stage: 'evaluation',
-      stageAttrs: {
-        'eval.faithfulness': 0, // Will be updated after evaluation
-        'eval.relevance': 0, // Will be updated after evaluation
-        'eval.policy_risk': 0, // Will be updated after evaluation
-        'eval.hallucination': 0, // Will be updated after evaluation
-        'eval.overall': 0, // Will be updated after evaluation
+  let scores: EvalScores;
+  let evaluationError: Error | null = null;
+  
+  try {
+    scores = startStageSpanSync(
+      {
+        requestId: req.requestId,
+        tenantId: req.tenantId,
+        stage: 'evaluation',
+        stageAttrs: {
+          'eval.faithfulness': 0, // Will be updated after evaluation
+          'eval.relevance': 0, // Will be updated after evaluation
+          'eval.policy_risk': 0, // Will be updated after evaluation
+          'eval.hallucination': 0, // Will be updated after evaluation
+          'eval.overall': 0, // Will be updated after evaluation
+        },
       },
-    },
-    (span: Span, ctx: StageSpanContext & { updateStatus: (status: RequestStatus) => void }) => {
-      const t0 = performance.now();
-      
-      // Keep llm_stage for backward compatibility
-      span.setAttribute('llm_stage', 'evaluator.score');
-      
-      const s = evaluate(llm.text, rag.context, req.chaos);
-      
-      // Update stage-specific attributes with actual values
-      setCommonSpanAttrs(span, {
-        'eval.faithfulness': s.faithfulness,
-        'eval.relevance': s.relevance,
-        'eval.policy_risk': s.policyRisk,
-        'eval.hallucination': s.hallucination,
-        'eval.overall': s.overall,
-      });
-      
-      // Record evaluation scores using single metric with dimension tag
-      m.evalScore.add(s.faithfulness, {
-        tenant_id: req.tenantId,
-        dimension: 'faithfulness',
-      });
-      m.evalScore.add(s.relevance, {
-        tenant_id: req.tenantId,
-        dimension: 'relevance',
-      });
-      m.evalScore.add(s.policyRisk, {
-        tenant_id: req.tenantId,
-        dimension: 'policy_risk',
-      });
-      m.evalScore.add(s.hallucination, {
-        tenant_id: req.tenantId,
-        dimension: 'hallucination',
-      });
-      m.evalScore.add(s.overall, {
-        tenant_id: req.tenantId,
-        dimension: 'overall',
-      });
-      
-      return s;
-    }
-  );
+      (span: Span, ctx: StageSpanContext & { updateStatus: (status: RequestStatus) => void }) => {
+        const t0 = performance.now();
+        
+        // Keep llm_stage for backward compatibility
+        span.setAttribute('llm_stage', 'evaluator.score');
+        
+        try {
+          // Use real deterministic evaluator
+          const evalScores = basicEvaluate({
+            query: req.input.text,
+            context: rag.context || '',
+            answer: llm.text,
+          });
+          
+          // Apply chaos flags if present (for testing)
+          let policyRisk = evalScores.policy_risk;
+          if (req.chaos?.policyRisk) {
+            policyRisk = 0.9; // Force high policy risk for testing
+          }
+          
+          const s: EvalScores = {
+            faithfulness: clamp01(evalScores.faithfulness),
+            relevance: clamp01(evalScores.relevance),
+            policyRisk: clamp01(policyRisk),
+            hallucination: clamp01(evalScores.hallucination),
+            overall: clamp01(evalScores.overall),
+            reasons: [],
+            formatCompliance: llm.text.length > 0 ? 1 : 0,
+          };
+          
+          // Generate reasons
+          if (s.faithfulness < 0.7) s.reasons?.push('Low faithfulness detected');
+          if (s.relevance < 0.5) s.reasons?.push('Low relevance to context');
+          if (s.policyRisk > 0.7) s.reasons?.push('High policy risk detected');
+          if (s.hallucination > 0.5) s.reasons?.push('Potential hallucination');
+          if (s.reasons && s.reasons.length === 0) s.reasons = undefined;
+          
+          // Update stage-specific attributes with actual values
+          setCommonSpanAttrs(span, {
+            'traceforge.status': 'OK',
+            'eval.faithfulness': s.faithfulness,
+            'eval.relevance': s.relevance,
+            'eval.policy_risk': s.policyRisk,
+            'eval.hallucination': s.hallucination,
+            'eval.overall': s.overall,
+          });
+          
+          // Record evaluation scores using single metric with dimension tag
+          m.evalScore.add(s.faithfulness, {
+            tenant_id: req.tenantId,
+            dimension: 'faithfulness',
+          });
+          m.evalScore.add(s.relevance, {
+            tenant_id: req.tenantId,
+            dimension: 'relevance',
+          });
+          m.evalScore.add(s.policyRisk, {
+            tenant_id: req.tenantId,
+            dimension: 'policy_risk',
+          });
+          m.evalScore.add(s.hallucination, {
+            tenant_id: req.tenantId,
+            dimension: 'hallucination',
+          });
+          m.evalScore.add(s.overall, {
+            tenant_id: req.tenantId,
+            dimension: 'overall',
+          });
+          
+          return s;
+        } catch (err) {
+          // Evaluation failed - classify error and mark span
+          const errorClass = classifyError('evaluation', err);
+          
+          span.setAttribute('error.type', errorClass.type);
+          span.setAttribute('error.code', errorClass.code);
+          span.setAttribute('error.message', errorClass.message);
+          span.setAttribute('traceforge.status', 'ERROR');
+          span.recordException(err as Error);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: errorClass.message });
+          
+          // Return safe defaults
+          const fallbackScores: EvalScores = {
+            faithfulness: 0.5,
+            relevance: 0.5,
+            policyRisk: 0.1,
+            hallucination: 0.3,
+            overall: 0.5,
+            reasons: ['Evaluation engine failure'],
+            formatCompliance: llm.text.length > 0 ? 1 : 0,
+          };
+          
+          // Still emit metrics with fallback scores
+          m.evalScore.add(fallbackScores.faithfulness, {
+            tenant_id: req.tenantId,
+            dimension: 'faithfulness',
+          });
+          m.evalScore.add(fallbackScores.relevance, {
+            tenant_id: req.tenantId,
+            dimension: 'relevance',
+          });
+          m.evalScore.add(fallbackScores.policyRisk, {
+            tenant_id: req.tenantId,
+            dimension: 'policy_risk',
+          });
+          m.evalScore.add(fallbackScores.hallucination, {
+            tenant_id: req.tenantId,
+            dimension: 'hallucination',
+          });
+          m.evalScore.add(fallbackScores.overall, {
+            tenant_id: req.tenantId,
+            dimension: 'overall',
+          });
+          
+          evaluationError = err as Error;
+          return fallbackScores;
+        }
+      }
+    );
+  } catch (err) {
+    // Outer catch for span creation failure (shouldn't happen, but be safe)
+    console.error('[Orchestrator] Evaluation span creation failed:', err);
+    evaluationError = err as Error;
+    scores = {
+      faithfulness: 0.5,
+      relevance: 0.5,
+      policyRisk: 0.1,
+      hallucination: 0.3,
+      overall: 0.5,
+      reasons: ['Evaluation stage failure'],
+      formatCompliance: llm.text.length > 0 ? 1 : 0,
+    };
+  }
 
   // --- REMEDIATION span: traceforge.remediation ---
   const remediationApplied = startStageSpanSync(
