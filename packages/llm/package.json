@@ -3,6 +3,19 @@
   "private": true,
   "version": "0.1.0",
   "main": "dist/index.js",
-  "types": "dist/index.d.ts"
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsup gemini/index.ts --format cjs --dts --outDir dist",
+    "dev": "tsup gemini/index.ts --format cjs --dts --outDir dist --watch"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "dotenv": "^17.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.3",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
 }
-

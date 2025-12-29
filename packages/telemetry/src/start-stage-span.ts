@@ -136,6 +136,10 @@ export async function startStageSpan<T>(
   let status: SpanStatus = 'OK';
   let error: { type?: string; message?: string } | undefined;
 
+  if (process.env.NODE_ENV !== 'production') {
+    console.log(`[Trace] Creating span: ${spanName} (stage: ${stage}, requestId: ${requestId})`);
+  }
+
   return tracer.startActiveSpan(spanName, { kind }, async (span) => {
     try {
       // Set mandatory attributes immediately
@@ -162,12 +166,18 @@ export async function startStageSpan<T>(
       // Final status update
       setMandatoryAttrs(span, requestId, tenantId, stage, status, error);
 
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`[Trace] Span ended (sync): ${spanName} (status: ${status})`);
+      }
       span.end();
       return result;
     } catch (err) {
       error = markSpanError(span, err);
       status = 'ERROR';
       setMandatoryAttrs(span, requestId, tenantId, stage, status, error);
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`[Trace] Span ended with ERROR (sync): ${spanName} (error: ${(err as any)?.message})`);
+      }
       span.end();
       throw err; // Re-throw to maintain existing error handling
     }
@@ -216,12 +226,18 @@ export function startStageSpanSync<T>(
       // Final status update
       setMandatoryAttrs(span, requestId, tenantId, stage, status, error);
 
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`[Trace] Span ended (sync): ${spanName} (status: ${status})`);
+      }
       span.end();
       return result;
     } catch (err) {
       error = markSpanError(span, err);
       status = 'ERROR';
       setMandatoryAttrs(span, requestId, tenantId, stage, status, error);
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`[Trace] Span ended with ERROR (sync): ${spanName} (error: ${(err as any)?.message})`);
+      }
       span.end();
       throw err; // Re-throw to maintain existing error handling
     }

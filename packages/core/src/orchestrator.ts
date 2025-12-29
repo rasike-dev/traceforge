@@ -6,6 +6,7 @@ import { trace, SpanKind, Span } from '@opentelemetry/api';
 import { startStageSpan, startStageSpanSync, SPAN_NAMES } from '@traceforge/telemetry';
 import type { StageSpanContext } from '@traceforge/telemetry';
 import { classifyError, determineFinalStatus, type ErrorClassification, type RequestStatus } from './error-taxonomy';
+import { GeminiProvider } from '@traceforge/llm';
 
 function clamp01(n: number) {
   return Math.max(0, Math.min(1, n));
@@ -26,23 +27,24 @@ async function mockToolCall(breakTool?: boolean) {
   return { toolResult: 'tool-ok', toolName: 'mock.weather' };
 }
 
-async function mockLlmGenerate(prompt: string, tokenSpike?: boolean) {
-  const output = `Answer (mock): ${prompt.slice(0, 200)}...`;
-  const inputTokens = tokenSpike ? 3500 : 200;
-  const outputTokens = tokenSpike ? 1200 : 120;
-  const totalTokens = inputTokens + outputTokens;
+/**
+ * Map LLM error to error type (coarse classification)
+ */
+function mapLLMErrorType(err: any): string {
+  if (err.status === 429) return 'RATE_LIMIT';
+  if (err.code === 'ETIMEDOUT' || err.message?.includes('timeout')) return 'TIMEOUT';
+  if (err.status === 400 && err.message?.includes('context')) return 'LLM_ERROR';
+  return 'LLM_ERROR';
+}
 
-  // cheap deterministic estimate (replace later with real pricing model)
-  const costUsdEstimate = totalTokens * 0.000001;
-
-  return {
-    text: output,
-    modelName: 'mock-gemini',
-    inputTokens,
-    outputTokens,
-    totalTokens,
-    costUsdEstimate,
-  };
+/**
+ * Map LLM error to error code (fine-grained classification)
+ */
+function mapLLMErrorCode(err: any): string {
+  if (err.status === 429) return 'LLM_RATE_LIMIT';
+  if (err.message?.includes('context') || err.message?.includes('too large')) return 'LLM_CONTEXT_TOO_LARGE';
+  if (err.status >= 500 || err.message?.includes('provider') || err.message?.includes('down')) return 'LLM_PROVIDER_DOWN';
+  return 'LLM_PROVIDER_DOWN';
 }
 
 function evaluate(answer: string, context: string, flags?: AskRequest['chaos']): EvalScores {
@@ -291,9 +293,10 @@ async function doOrchestrate(
       requestId: req.requestId,
       tenantId: req.tenantId,
       stage: 'llm',
+      kind: SpanKind.CLIENT, // LLM calls are external (CLIENT)
       stageAttrs: {
-        'llm.provider': 'mock',
-        'llm.model': 'mock-gemini', // Will be updated after result
+        'llm.provider': 'google', // Will be updated after result
+        'llm.model': 'gemini-pro', // Will be updated after result
         'llm.tokens.input': 0, // Will be updated after result
         'llm.tokens.output': 0, // Will be updated after result
         'llm.tokens.total': 0, // Will be updated after result
@@ -306,45 +309,105 @@ async function doOrchestrate(
       // Keep llm_stage for backward compatibility
       span.setAttribute('llm_stage', 'llm.generate');
       
-      const res = await mockLlmGenerate(prompt, req.chaos?.tokenSpike);
-      
-      // Update stage-specific attributes with actual values
-      setCommonSpanAttrs(span, {
-        'llm.model': res.modelName,
-        'llm.tokens.input': res.inputTokens,
-        'llm.tokens.output': res.outputTokens,
-        'llm.tokens.total': res.totalTokens,
-        'llm.cost.usd': res.costUsdEstimate,
-      });
-      
-      // Record latency metric
-      m.llmLatencyMs.record(performance.now() - t0, {
-        tenant_id: req.tenantId,
-        llm_provider: 'mock',
-        llm_model: res.modelName,
-      });
+      try {
+        // Initialize Gemini provider (singleton pattern from gemini.client.ts)
+        const geminiProvider = new GeminiProvider();
+        
+        // Generate response from Gemini
+        const geminiResult = await geminiProvider.generate({
+          prompt: prompt,
+        });
+        
+        // Adapt Gemini result to orchestrator's expected format
+        const res = {
+          text: geminiResult.text,
+          modelName: 'gemini-pro', // Updated to match provider default
+          inputTokens: geminiResult.tokens.input,
+          outputTokens: geminiResult.tokens.output,
+          totalTokens: geminiResult.tokens.total,
+          costUsdEstimate: geminiResult.costUsd,
+        };
+        
+        const latencyMs = performance.now() - t0;
+        
+        // Update stage-specific attributes with actual values
+        setCommonSpanAttrs(span, {
+          'traceforge.status': 'OK',
+          'llm.provider': 'google',
+          'llm.model': res.modelName,
+          'llm.tokens.input': res.inputTokens,
+          'llm.tokens.output': res.outputTokens,
+          'llm.tokens.total': res.totalTokens,
+          'llm.cost.usd': res.costUsdEstimate,
+          // Promoted attribute for root span
+          'model': res.modelName,
+        });
+        
+        // Record latency metric
+        m.llmLatencyMs.record(latencyMs, {
+          tenant_id: req.tenantId,
+          llm_provider: 'google',
+          llm_model: res.modelName,
+        });
 
-      // Emit metrics (for dashboards, trends, alerts)
-      m.llmTokensInput.add(res.inputTokens, {
-        tenant_id: req.tenantId,
-        llm_provider: 'mock',
-        llm_model: res.modelName,
-      });
-      m.llmTokensOutput.add(res.outputTokens, {
-        tenant_id: req.tenantId,
-        llm_provider: 'mock',
-        llm_model: res.modelName,
-      });
-      m.llmCostUsd.add(res.costUsdEstimate, {
-        tenant_id: req.tenantId,
-        llm_provider: 'mock',
-        llm_model: res.modelName,
-      });
+        // Emit metrics (for dashboards, trends, alerts)
+        m.llmTokensInput.add(res.inputTokens, {
+          tenant_id: req.tenantId,
+          llm_provider: 'google',
+          llm_model: res.modelName,
+        });
+        m.llmTokensOutput.add(res.outputTokens, {
+          tenant_id: req.tenantId,
+          llm_provider: 'google',
+          llm_model: res.modelName,
+        });
+        m.llmCostUsd.add(res.costUsdEstimate, {
+          tenant_id: req.tenantId,
+          llm_provider: 'google',
+          llm_model: res.modelName,
+        });
 
-      // Update root span with model name
-      requestSpan.setAttribute('model', res.modelName);
+        // Update root span with model name
+        requestSpan.setAttribute('model', res.modelName);
+        
+        // Update status to OK
+        ctx.updateStatus('OK');
 
-      return res;
+        return res;
+      } catch (err: any) {
+        const latencyMs = performance.now() - t0;
+        
+        // Classify error using taxonomy (canonical error mapping)
+        const errorClass = classifyError('llm', err, {
+          rateLimit: err.status === 429 || err.message?.includes('rate limit'),
+          providerDown: err.status >= 500 || err.message?.includes('provider') || err.message?.includes('down'),
+        });
+        
+        // Update span attributes for error
+        setCommonSpanAttrs(span, {
+          'traceforge.status': 'ERROR',
+          'error.type': errorClass.type,
+          'error.code': errorClass.code,
+          'error.message': errorClass.message,
+        });
+        
+        // Record exception
+        span.recordException(err);
+        span.setStatus({ code: 2, message: errorClass.message }); // SpanStatusCode.ERROR = 2
+        
+        // Still record latency metric (even on error)
+        m.llmLatencyMs.record(latencyMs, {
+          tenant_id: req.tenantId,
+          llm_provider: 'google',
+          llm_model: 'gemini-1.5-flash',
+        });
+        
+        // Update status to ERROR
+        ctx.updateStatus('ERROR');
+        
+        // Re-throw to maintain error handling flow
+        throw err;
+      }
     }
   );
 

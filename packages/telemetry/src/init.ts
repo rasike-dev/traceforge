@@ -4,19 +4,28 @@ import { resourceFromAttributes } from '@opentelemetry/resources';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-http';
 import { PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
+import { SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 
 let sdk: NodeSDK | undefined;
 let metricReader: PeriodicExportingMetricReader | undefined;
 
 export function initTelemetry() {
-  if (sdk) return;
+  if (sdk) {
+    console.log('[Telemetry] SDK already initialized, skipping');
+    return;
+  }
 
   const baseEndpoint =
     process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.replace(/\/v1\/traces$/, '') ??
     'http://localhost:4318';
 
+  console.log('[Telemetry] Initializing OpenTelemetry SDK');
+  console.log('[Telemetry] OTLP Endpoint:', `${baseEndpoint}/v1/traces`);
+
   const traceExporter = new OTLPTraceExporter({
     url: `${baseEndpoint}/v1/traces`,
+    // Add headers if needed for Datadog
+    headers: {},
   });
 
   const metricExporter = new OTLPMetricExporter({
@@ -50,9 +59,13 @@ export function initTelemetry() {
   // Merge: OTEL_RESOURCE_ATTRIBUTES overrides defaults
   const finalAttributes = { ...defaultAttributes, ...resourceAttributes };
 
+  // Use SimpleSpanProcessor for immediate export (good for testing)
+  // In production, you might want BatchSpanProcessor for better performance
+  const spanProcessor = new SimpleSpanProcessor(traceExporter);
+
   sdk = new NodeSDK({
     resource: resourceFromAttributes(finalAttributes),
-    traceExporter,
+    spanProcessor, // Use immediate export processor
     metricReader,
     instrumentations: [
       getNodeAutoInstrumentations({
@@ -62,6 +75,26 @@ export function initTelemetry() {
   });
 
   sdk.start();
+  console.log('[TraceForge] Telemetry SDK started successfully');
+  console.log('[TraceForge] Service:', finalAttributes['service.name']);
+  console.log('[TraceForge] Environment:', finalAttributes['deployment.environment']);
+  console.log('[TraceForge] Trace exporter URL:', `${baseEndpoint}/v1/traces`);
+  
+  // Add export verification logging
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[TraceForge] Trace exporter ready - traces will be sent to Datadog Agent');
+  }
+
+  // Add shutdown handler to flush traces on exit
+  process.on('SIGTERM', async () => {
+    console.log('[TraceForge] Flushing traces before shutdown...');
+    await sdk?.shutdown();
+  });
+
+  process.on('SIGINT', async () => {
+    console.log('[TraceForge] Flushing traces before shutdown...');
+    await sdk?.shutdown();
+  });
 }
 
 /**
@@ -71,6 +104,18 @@ export function initTelemetry() {
 export async function forceFlushMetrics(): Promise<void> {
   if (metricReader) {
     await metricReader.forceFlush();
+  }
+}
+
+/**
+ * Force flush traces immediately (useful for testing/verification)
+ * SimpleSpanProcessor should export immediately, but this ensures it
+ */
+export async function forceFlushTraces(): Promise<void> {
+  if (sdk) {
+    await sdk.shutdown();
+    // Note: shutdown flushes, but we need to restart SDK after
+    // For now, SimpleSpanProcessor should handle immediate export
   }
 }
 

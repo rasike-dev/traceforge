@@ -1,4 +1,13 @@
 // apps/api/src/main.ts
+// Load environment variables from .env file (must be first)
+// Use explicit path to project root .env file
+import { config } from 'dotenv';
+import { resolve, join } from 'path';
+
+// Resolve .env path: from dist/ directory, go up to project root
+const envPath = resolve(__dirname, '../../../.env');
+config({ path: envPath });
+
 import { initTelemetry } from '@traceforge/telemetry';
 
 // MUST be first — before Nest or any HTTP libs load

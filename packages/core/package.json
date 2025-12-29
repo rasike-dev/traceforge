@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
-    "@traceforge/telemetry": "workspace:*"
+    "@traceforge/telemetry": "workspace:*",
+    "@traceforge/llm": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.19.3"
