@@ -50,27 +50,13 @@ function mapLLMErrorCode(err: any): string {
 
 // Removed evaluate() wrapper - now using basicEvaluate() directly in evaluation span
 
-function remediate(scores: EvalScores, toolFailed: boolean): RemediationReport {
-  const actions: RemediationReport['actions'] = [];
-  let finalMode: RemediationReport['finalMode'] = 'NORMAL';
-
-  if (scores.policyRisk > 0.7) {
-    actions.push({ type: 'SAFE_MODE', reason: 'Policy risk threshold exceeded' });
-    finalMode = 'SAFE';
-  } else if (toolFailed) {
-    actions.push({ type: 'FALLBACK_TOOL', reason: 'Tool execution failed' });
-    finalMode = 'DEGRADED';
-  } else if (scores.faithfulness < 0.8) {
-    actions.push({ type: 'CLARIFICATION', reason: 'Low faithfulness score' });
-    finalMode = 'DEGRADED';
-  }
-
-  return {
-    triggered: actions.length > 0,
-    actions,
-    finalMode,
-  };
-}
+/**
+ * Remediation logic for Phase 1.1.4
+ * Scope: CLARIFICATION only (simple, safe, demo-friendly)
+ * Trigger: if eval.overall < 0.75
+ */
+// Removed remediate() function - now using inline remediation logic in remediation span
+// Phase 1.1.4: Only CLARIFICATION remediation is implemented (triggered when overall < 0.75)
 
 export async function orchestrate(req: AskRequest): Promise<AskResponse> {
   const start = performance.now();
@@ -539,7 +525,10 @@ async function doOrchestrate(
   }
 
   // --- REMEDIATION span: traceforge.remediation ---
-  const remediationApplied = startStageSpanSync(
+  let remediationApplied: RemediationReport;
+  let clarificationMessage: string | undefined;
+  
+  remediationApplied = startStageSpanSync(
     {
       requestId: req.requestId,
       tenantId: req.tenantId,
@@ -554,70 +543,96 @@ async function doOrchestrate(
       // Keep llm_stage for backward compatibility
       span.setAttribute('llm_stage', 'remediation.apply');
       
-      const action = remediate(scores, toolFailed);
+      const overall = scores.overall;
       
-      // Determine status based on final mode
-      if (action.finalMode === 'DEGRADED') ctx.updateStatus('DEGRADED');
-      else if (action.finalMode === 'SAFE') ctx.updateStatus('DEGRADED'); // SAFE is a form of degradation
-      
-      // Stage-specific attributes
-      const remediationAction = action.actions.length > 0 ? action.actions[0].type : 'NONE';
-      const remediationReason = action.actions.length > 0 ? action.actions[0].reason : 'No remediation needed';
-      
-      setCommonSpanAttrs(span, {
-        'remediation.triggered': action.triggered,
-        'remediation.action': remediationAction,
-        'remediation.reason': remediationReason,
-      });
-      
-      // Add span events for remediation actions
-      if (action.triggered) {
-        for (const act of action.actions) {
-          if (act.type === 'FALLBACK_TOOL') {
-            span.addEvent('tool.fallback', {
-              reason: act.reason,
-              action: act.type,
-            });
-          } else if (act.type === 'SAFE_MODE') {
-            span.addEvent('remediation.safe_mode', {
-              reason: act.reason,
-              action: act.type,
-            });
-          } else if (act.type === 'CLARIFICATION') {
-            span.addEvent('remediation.clarification', {
-              reason: act.reason,
-              action: act.type,
-            });
-          }
-        }
+      // Phase 1.1.4: Simple trigger rule - if overall < 0.75, trigger CLARIFICATION
+      if (overall >= 0.75) {
+        // No remediation needed
+        setCommonSpanAttrs(span, {
+          'traceforge.status': 'OK',
+          'remediation.triggered': false,
+          'remediation.action': 'NONE',
+          'remediation.reason': 'Quality score above threshold',
+        });
+        
+        const result: RemediationReport = {
+          triggered: false,
+          actions: [],
+          finalMode: 'NORMAL',
+        };
+        return result;
       }
       
-      return action;
+      // ---- Remediation triggered (CLARIFICATION only for Phase 1.1) ----
+      const remediationAction: RemediationReport['actions'][0] = {
+        type: 'CLARIFICATION',
+        reason: `Low overall quality score (${overall.toFixed(2)} < 0.75)`,
+      };
+      
+      setCommonSpanAttrs(span, {
+        'traceforge.status': 'OK', // Span itself is OK, request becomes DEGRADED
+        'remediation.triggered': true,
+        'remediation.action': 'CLARIFICATION',
+        'remediation.reason': remediationAction.reason,
+      });
+      
+      // Span event (important for traces)
+      span.addEvent('remediation.clarification', {
+        reason: 'eval.overall below threshold',
+        action: 'CLARIFICATION',
+        score: overall,
+      });
+      
+      // Metric
+      m.remediationTriggered.add(1, {
+        tenant_id: req.tenantId,
+        action: 'CLARIFICATION',
+      });
+      
+      // Promote remediation to root span
+      requestSpan.setAttribute('remediation', 'CLARIFICATION');
+      
+      // Update request status to DEGRADED
+      ctx.updateStatus('DEGRADED');
+      
+      // Generate clarification message (demo-friendly)
+      clarificationMessage = 'I may not have enough reliable information. Could you clarify or provide more details?';
+      
+      const result: RemediationReport = {
+        triggered: true,
+        actions: [remediationAction],
+        finalMode: 'DEGRADED',
+      };
+      return result;
     }
   );
 
-  // Remediation counters - use single metric with action tag
-  if (remediationApplied.triggered) {
-    for (const action of remediationApplied.actions) {
-      m.remediationTriggered.add(1, {
-        tenant_id: req.tenantId,
-        action: action.type,
-      });
-    }
-  }
+  // Note: Remediation metric is now emitted inside the span callback above
+  // This ensures it's only emitted when remediation is actually triggered
 
   // Determine final status using error taxonomy
   const hasUsableResponse = true; // We always produce a response (even if degraded)
   const remediationSucceeded = remediationApplied.triggered && remediationApplied.finalMode !== 'NORMAL';
-  const finalStatus = determineFinalStatus(
-    stageErrors,
-    remediationApplied.triggered,
-    remediationSucceeded,
-    hasUsableResponse
-  );
+  
+  // If remediation was triggered, status should be DEGRADED (already set in remediation span)
+  // Otherwise, determine from stage errors
+  let finalStatus: RequestStatus;
+  if (remediationApplied.triggered) {
+    finalStatus = 'DEGRADED'; // Remediation triggered = DEGRADED
+  } else {
+    finalStatus = determineFinalStatus(
+      stageErrors,
+      remediationApplied.triggered,
+      remediationSucceeded,
+      hasUsableResponse
+    );
+  }
   
   // Update root span with final status and error info
   requestCtx.updateStatus(finalStatus);
+  
+  // CRITICAL: Set traceforge.status on root span (powers SLOs, error budgets, dashboards)
+  requestSpan.setAttribute('traceforge.status', finalStatus);
   
   // Set error attributes on root span if there were errors
   const dominantError = stageErrors.find(e => e.error !== null)?.error;
@@ -626,19 +641,15 @@ async function doOrchestrate(
     requestSpan.setAttribute('traceforge.error.code', dominantError.code);
   }
   
-  const remediationTag = remediationApplied.finalMode === 'DEGRADED' ? 'degraded' : 
-                         remediationApplied.finalMode === 'SAFE' ? 'safe_mode' : 'normal';
-  requestSpan.setAttribute('remediation', remediationTag);
-
-  // Apply remediation
-  let answer = llm.text;
-  if (remediationApplied.finalMode === 'SAFE') {
-    answer = `Safe mode: I can't help with that request. Please rephrase or provide a safer alternative.`;
-      } else if (remediationApplied.finalMode === 'DEGRADED' && remediationApplied.actions.some((a: { type: string }) => a.type === 'FALLBACK_TOOL')) {
-        answer = `${answer}\n\n(Note: tool degraded; returned fallback response.)`;
-      } else if (remediationApplied.finalMode === 'DEGRADED' && remediationApplied.actions.some((a: { type: string }) => a.type === 'CLARIFICATION')) {
-    answer = `I might be missing context. Can you clarify what exactly you mean by: "${req.input.text}"?`;
+  // Promote remediation to root span (Phase 1.1.4 requirement)
+  if (remediationApplied.triggered && remediationApplied.actions.some((a: { type: string }) => a.type === 'CLARIFICATION')) {
+    requestSpan.setAttribute('remediation', 'CLARIFICATION');
+  } else {
+    requestSpan.setAttribute('remediation', 'none');
   }
+
+  // Apply remediation - use clarification message if remediation was triggered
+  const answer = clarificationMessage || llm.text;
 
   // Add final summary to root span
   setCommonSpanAttrs(requestSpan, {
