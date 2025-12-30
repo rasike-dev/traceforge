@@ -8,16 +8,18 @@ import type { StageSpanContext } from '@traceforge/telemetry';
 import { classifyError, determineFinalStatus, type ErrorClassification, type RequestStatus } from './error-taxonomy';
 import { GeminiProvider } from '@traceforge/llm';
 import { basicEvaluate } from '@traceforge/evaluator';
+import { QdrantRagProvider } from '@traceforge/rag';
 
 function clamp01(n: number) {
   return Math.max(0, Math.min(1, n));
 }
 
-// Mock implementations (Phase A)
-async function mockRag(input: string, badRag?: boolean) {
-  if (badRag) return { context: 'irrelevant context about something else', docs: 0 };
-  return { context: `relevant context for: ${input}`, docs: 3 };
-}
+// Real RAG provider (Phase 1.2)
+const qdrantRagProvider = new QdrantRagProvider(
+  process.env.QDRANT_URL || 'http://localhost:6333',
+  process.env.QDRANT_COLLECTION || 'traceforge_demo',
+  5 // default topK
+);
 
 async function mockToolCall(breakTool?: boolean) {
   if (breakTool) {
@@ -89,6 +91,8 @@ async function doOrchestrate(
   // Track stage errors for final status determination
   const stageErrors: Array<{ stage: string; error: ErrorClassification | null }> = [];
   // --- RAG span: traceforge.rag ---
+  // --- RAG span: traceforge.rag (real Qdrant integration) ---
+  const ragTopK = 5;
   const rag = await startStageSpan(
     {
       requestId: req.requestId,
@@ -96,56 +100,83 @@ async function doOrchestrate(
       stage: 'rag',
       kind: SpanKind.CLIENT,
       stageAttrs: {
-        'rag.provider': 'mock',
-        'rag.top_k': 3,
+        'rag.provider': 'qdrant',
+        'rag.top_k': ragTopK,
         'rag.docs.count': 0, // Will be updated after result
         'rag.query.length': req.input.text.length,
       },
     },
-    async (span: Span, ctx: StageSpanContext & { updateStatus: (status: 'OK' | 'ERROR' | 'DEGRADED') => void }) => {
+    async (span: Span, ctx: StageSpanContext & { updateStatus: (status: RequestStatus) => void }) => {
       const t0 = performance.now();
       
       // Keep llm_stage for backward compatibility
       span.setAttribute('llm_stage', 'rag.retrieve');
       
-      const result = await mockRag(req.input.text, req.chaos?.badRag);
-      
-      // Update stage-specific attributes with actual values
-      setCommonSpanAttrs(span, {
-        'rag.docs.count': result.docs,
-      });
-      
-      m.ragLatencyMs.record(performance.now() - t0, {
-        tenant_id: req.tenantId,
-        rag_provider: 'mock',
-      });
-      
-      // Record RAG docs count (gauge-like)
-      m.ragDocsCount.add(result.docs, {
-        tenant_id: req.tenantId,
-        rag_provider: 'mock',
-      });
-      
-      // Empty docs is not an error - status stays OK
-      if (result.docs === 0) {
-        // Not an error, just empty result
-        stageErrors.push({ stage: 'rag', error: null });
-      } else {
-        stageErrors.push({ stage: 'rag', error: null });
+      try {
+        // Use real Qdrant RAG provider
+        const result = await qdrantRagProvider.retrieve({
+          query: req.input.text,
+          topK: ragTopK,
+        });
+        
+        // Update stage-specific attributes with actual values
+        setCommonSpanAttrs(span, {
+          'traceforge.status': 'OK',
+          'rag.docs.count': result.docs,
+        });
+        
+        const latencyMs = performance.now() - t0;
+        
+        // Record RAG latency metric
+        m.ragLatencyMs.record(latencyMs, {
+          tenant_id: req.tenantId,
+          rag_provider: 'qdrant',
+        });
+        
+        // Record RAG docs count (gauge-like)
+        m.ragDocsCount.add(result.docs, {
+          tenant_id: req.tenantId,
+          rag_provider: 'qdrant',
+        });
+        
+        // Empty docs is not an error - status stays OK
+        if (result.docs === 0) {
+          // Not an error, just empty result
+          stageErrors.push({ stage: 'rag', error: null });
+        } else {
+          stageErrors.push({ stage: 'rag', error: null });
+        }
+        
+        return result;
+      } catch (err) {
+        // RAG retrieval failed - classify error and mark span
+        const errorClass = classifyError('rag', err, { providerDown: true });
+        
+        span.setAttribute('error.type', errorClass.type);
+        span.setAttribute('error.code', errorClass.code);
+        span.setAttribute('error.message', errorClass.message);
+        span.setAttribute('traceforge.status', 'ERROR');
+        span.recordException(err as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: errorClass.message });
+        ctx.updateStatus('ERROR');
+        stageErrors.push({ stage: 'rag', error: errorClass });
+        
+        // Return empty result on error (don't fail the request)
+        const latencyMs = performance.now() - t0;
+        m.ragLatencyMs.record(latencyMs, {
+          tenant_id: req.tenantId,
+          rag_provider: 'qdrant',
+        });
+        m.ragDocsCount.add(0, {
+          tenant_id: req.tenantId,
+          rag_provider: 'qdrant',
+        });
+        
+        return {
+          context: '',
+          docs: 0,
+        };
       }
-      
-      // Force error for observability test (temporary) - remove this later
-      const forcedError = new Error('forced error for observability test');
-      const errorClass = classifyError('rag', forcedError, { providerDown: true });
-      span.setAttribute('error.type', errorClass.type);
-      span.setAttribute('error.code', errorClass.code);
-      span.setAttribute('error.message', errorClass.message);
-      span.recordException(forcedError);
-      span.setStatus({ code: 2, message: errorClass.message }); // SpanStatusCode.ERROR = 2
-      ctx.updateStatus('ERROR');
-      stageErrors.push({ stage: 'rag', error: errorClass });
-      
-      return result;
     }
   );
 
