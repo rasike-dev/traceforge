@@ -77,5 +77,10 @@ export const m = {
   remediationTriggered: meter.createCounter('traceforge.remediation.triggered', {
     description: 'Remediation actions triggered. Use action tag: SAFE_MODE | FALLBACK_TOOL | CLARIFICATION | RETRY_LLM',
   }),
+
+  // === traceforge.quality.* ===
+  qualityOk: meter.createCounter('traceforge.request.quality_ok', {
+    description: 'Requests that meet quality threshold (overall score >= 0.75). Used for Response Quality SLO calculation.',
+  }),
 };
 

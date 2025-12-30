@@ -25,7 +25,7 @@ async function mockToolCall(breakTool?: boolean) {
     (err as any).code = 'TOOL_TIMEOUT';
     throw err;
   }
-  return { toolResult: 'tool-ok', toolName: 'mock.weather' };
+  return { toolResult: 'tool-ok', toolName: 'weather.mock' };
 }
 
 /**
@@ -151,7 +151,9 @@ async function doOrchestrate(
 
   // --- TOOL span: traceforge.tool (repeatable) ---
   let toolFailed = false;
-  const toolName = 'mock.weather';
+  // Tool naming convention: <category>* (e.g., weather*, vector_db*, document_lookup*, payment*, search*)
+  // This supports wildcard filtering in SLOs: tool_name:weather*, tool_name:vector_db*, etc.
+  const toolName = 'weather.mock'; // Matches tool_name:weather* pattern for SLO filtering
   const toolAttempt = 1;
   const toolTimeoutMs = 5000;
   const toolT0 = performance.now();
@@ -675,6 +677,15 @@ async function doOrchestrate(
     tenant_id: req.tenantId,
     status: finalStatus,
   });
+
+  // Quality SLO metric: increment if overall score meets threshold (>= 0.75)
+  const qualityThreshold = 0.75;
+  if (scores.overall >= qualityThreshold) {
+    m.qualityOk.add(1, {
+      tenant_id: req.tenantId,
+      status: finalStatus,
+    });
+  }
 
   // Get trace context for debug field
   const activeSpan = trace.getActiveSpan();
