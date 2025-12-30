@@ -658,10 +658,16 @@ async function doOrchestrate(
     'result.hallucination': scores.hallucination > 0.5,
   });
 
-  // End-to-end latency with final status
+  // Determine remediation tag value for metric
+  const remediationTag = remediationApplied.triggered && remediationApplied.actions.length > 0
+    ? remediationApplied.actions[0].type
+    : 'none';
+
+  // End-to-end latency with final status and remediation
   m.requestLatencyMs.record(performance.now() - start, {
     tenant_id: req.tenantId,
     status: finalStatus,
+    remediation: remediationTag,
   });
   
   // Request count with status tag (moved here so we have final status)

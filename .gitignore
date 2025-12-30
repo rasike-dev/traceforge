@@ -119,3 +119,9 @@ out/
 # pnpm store (local)
 .pnpm-store/
 
+# Query/documentation files (temporary)
+DATADOG_QUERIES.md
+METRICS_AND_SPANS.md
+P95_LATENCY_QUERIES.md
+SETUP_ENV.md
+
