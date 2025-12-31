@@ -1,0 +1,20 @@
+{
+  "id": 246876064,
+  "name": "TraceForge – Avg LLM Cost Per Request is High",
+  "type": "query alert",
+  "query": "sum(last_5m):sum:traceforge.llm.cost.usd{*}.as_count() / sum:traceforge.request.count{*}.as_count() > 0.05",
+  "message": "{{#is_alert}}\n🚨 *TraceForge Cost Alert*\n\nThe average LLM cost per request has exceeded the *critical threshold*.\n\n• Alert threshold: > $0.05 per request\n• Evaluation window: last 5 minutes\n• Service: traceforge-api\n• Environment: {{env.name}}\n\n👉 Immediate actions:\n1. Check recent LLM token usage and model selection.\n2. Look for prompt size regressions or unexpected loops.\n3. Verify if fallback or retries are increasing token usage.\n\nRecommended next step:\n• Open APM traces filtered by high `llm.tokens.total`\n• Review recent deployments or configuration changes.\n{{/is_alert}}\n\n{{#is_warning}}\n⚠️ *TraceForge Cost Warning*\n\nThe average LLM cost per request is higher than expected and approaching the alert threshold.\n\n• Warning threshold: > $0.02 per request\n• Service: traceforge-api\n• Environment: {{env.name}}\n\n👉 Suggested actions:\n• Monitor token usage trends\n• Check for increased request complexity or traffic patterns\n{{/is_warning}}\n\n{{#is_recovery}}\n✅ *TraceForge Cost Recovered*\n\nAverage LLM cost per request has returned to a normal range.\nNo further action required.\n{{/is_recovery}}",
+  "tags": ["", "service:traceforge-api"],
+  "options": {
+    "thresholds": {
+      "critical": 0.05,
+      "warning": 0.02
+    },
+    "notify_audit": false,
+    "on_missing_data": "default",
+    "include_tags": false,
+    "new_host_delay": 300
+  },
+  "priority": 1,
+  "draft_status": "published"
+}
