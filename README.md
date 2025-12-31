@@ -47,22 +47,26 @@ TraceForge is the **first orchestration platform** that combines:
 - **Error tracking**: Automatic error capture and attribution
 
 ### 🎯 Quality Evaluation
-- **Faithfulness scoring**: Detects when responses don't match context
-- **Relevance assessment**: Ensures retrieved context matches the query
-- **Policy risk detection**: Identifies potential compliance violations
-- **Hallucination detection**: Flags suspicious outputs automatically
+- **Faithfulness scoring**: Detects when responses don't match context (0-1 scale)
+- **Relevance assessment**: Ensures retrieved context matches the query (0-1 scale)
+- **Policy risk detection**: Identifies potential compliance violations (0-1 scale)
+- **Hallucination detection**: Flags suspicious outputs automatically (0-1 scale)
+- **Overall quality score**: Weighted composite (threshold: 0.75 for remediation)
+- **Automatic evaluation**: Runs on every request with full observability
 
 ### 🛡️ Automatic Remediation
-- **Safe mode**: Activates when policy risks are detected
-- **Fallback tools**: Switches to backup tools when primary tools fail
-- **Clarification requests**: Asks users for clarification when quality is low
-- **Configurable thresholds**: Fine-tune when remediation triggers
+- **CLARIFICATION**: Requests user clarification when quality is low (`overall < 0.75`)
+- **Status degradation**: Root span marked as `DEGRADED` when remediation triggers
+- **Observable remediation**: Full tracing and metrics for all remediation actions
+- **Configurable thresholds**: Quality threshold (0.75) can be adjusted
+- **Future strategies**: SAFE_MODE, FALLBACK_TOOL, RETRY_LLM (coming soon)
 
 ### 💰 Cost & Performance Tracking
-- **Token monitoring**: Track input, output, and total tokens per request
-- **Cost estimation**: Real-time USD cost calculation
-- **Performance metrics**: Latency tracking for every stage
-- **Multi-tenant support**: Isolate metrics by tenant
+- **Token monitoring**: Track input, output, and total tokens per request (real Gemini API)
+- **Cost estimation**: Real-time USD cost calculation based on actual model pricing
+- **Performance metrics**: Latency tracking for every stage (RAG, LLM, evaluation, remediation)
+- **Multi-tenant support**: Isolate metrics by tenant ID
+- **Model fallback tracking**: Automatic fallback to available models with cost transparency
 
 ---
 
@@ -90,7 +94,9 @@ traceforge/
 - **Runtime**: Node.js with TypeScript
 - **Framework**: NestJS (for API layer)
 - **Build Tool**: tsup (for packages)
-- **Observability**: OpenTelemetry (traces + metrics)
+- **Observability**: OpenTelemetry (traces + metrics) → Datadog
+- **LLM Provider**: Google Gemini (real API integration)
+- **Vector Database**: Qdrant (local Docker, keyword search)
 - **Package Manager**: pnpm workspaces
 
 ---
@@ -101,6 +107,8 @@ traceforge/
 
 - Node.js 18+ 
 - pnpm 10.26+
+- Docker (for Qdrant vector database)
+- Datadog account (for observability)
 
 ### Installation
 
@@ -116,25 +124,64 @@ pnpm install
 pnpm -r build
 ```
 
+### Environment Setup
+
+1. **Get API Keys**:
+
+   **Google Gemini API Key**:
+   - Go to [Google AI Studio](https://makersuite.google.com/app/apikey)
+   - Create a new API key
+   - Copy the key
+
+   **Datadog API Key**:
+   - Go to [Datadog API Keys](https://app.datadoghq.com/organization-settings/api-keys)
+   - Create a new API key
+   - Copy the key
+
+2. **Create `.env` file** in the project root:
+
+```bash
+# Required: Google Gemini API Key
+GEMINI_API_KEY=your-gemini-api-key-here
+
+# Required: Datadog API Key (for Datadog Agent)
+DD_API_KEY=your-datadog-api-key-here
+
+# Optional: OpenTelemetry Configuration
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+OTEL_METRIC_EXPORT_INTERVAL_MS=5000
+NODE_ENV=development
+```
+
+2. **Start Qdrant (Vector Database)**:
+
+```bash
+# Run Qdrant in Docker
+docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
+
+# Seed Qdrant with demo documents
+cd packages/rag
+pnpm tsx src/qdrant/seed.ts
+```
+
+3. **Start Datadog Agent** (for observability):
+
+```bash
+cd infra/datadog
+docker-compose up -d
+```
+
 ### Running the API
 
 ```bash
 # Start the API server (development mode)
-cd apps/api
-pnpm start:dev
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+pnpm --filter api run start:dev
 
 # The API will be available at http://localhost:3000
 ```
 
-### Environment Variables
-
-Configure OpenTelemetry endpoint (optional):
-
-```bash
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
-export OTEL_METRIC_EXPORT_INTERVAL_MS=5000
-export NODE_ENV=development
-```
+**Note**: Make sure Qdrant and Datadog Agent are running before starting the API.
 
 ---
 
@@ -160,11 +207,13 @@ Content-Type: application/json
 }
 ```
 
-**Query Parameters** (for chaos testing):
+**Query Parameters** (for testing):
 - `breakTool=true` - Simulate tool failure
 - `badRag=true` - Simulate poor RAG retrieval
 - `policyRisk=true` - Simulate policy violation
 - `tokenSpike=true` - Simulate high token usage
+
+**Note**: All parameters are optional. The system will use real Gemini API and Qdrant RAG by default.
 
 **Response**:
 
@@ -175,17 +224,43 @@ Content-Type: application/json
   "scores": {
     "faithfulness": 0.88,
     "relevance": 0.9,
-    "policyRisk": 0.1,
-    "formatCompliance": 1,
-    "hallucinationSuspected": 0
+    "policy_risk": 0.1,
+    "hallucination": 0.12,
+    "overall": 0.85
   },
   "meta": {
-    "modelName": "mock-gemini",
+    "modelName": "gemini-2.5-flash",
     "inputTokens": 200,
     "outputTokens": 120,
     "totalTokens": 320,
     "costUsdEstimate": 0.00032,
-    "remediationApplied": null
+    "remediation": null,
+    "ragDocs": 3
+  }
+}
+```
+
+**Response with Remediation** (when quality is low):
+
+```json
+{
+  "requestId": "550e8400-e29b-41d4-a716-446655440001",
+  "answer": "I may not have enough reliable information. Could you clarify or provide more details?",
+  "scores": {
+    "faithfulness": 0.45,
+    "relevance": 0.5,
+    "policy_risk": 0.1,
+    "hallucination": 0.55,
+    "overall": 0.65
+  },
+  "meta": {
+    "modelName": "gemini-2.5-flash",
+    "inputTokens": 180,
+    "outputTokens": 95,
+    "totalTokens": 275,
+    "costUsdEstimate": 0.00028,
+    "remediation": "CLARIFICATION",
+    "ragDocs": 0
   }
 }
 ```
@@ -275,6 +350,19 @@ pnpm build
 pnpm dev
 ```
 
+### Testing the Demo Scenario
+
+Run the included demo script to see good vs. bad paths with remediation:
+
+```bash
+# Run demo scenario (good path + bad path with remediation)
+./demo-scenario.sh
+```
+
+This script demonstrates:
+- ✅ **Good path**: High quality response → `status=OK`, no remediation
+- ⚠️ **Bad path**: Low quality response → `status=DEGRADED`, `remediation=CLARIFICATION`
+
 ### Running Tests
 
 ```bash
@@ -318,13 +406,55 @@ OpenTelemetry initialization and configuration. Sets up distributed tracing and 
 **Key exports**:
 - `initTelemetry()` - Initialize OpenTelemetry SDK
 
+### `@traceforge/evaluator`
+
+Deterministic quality evaluation system that scores LLM responses on multiple dimensions.
+
+**Key exports**:
+- `basicEvaluate()` - Evaluates responses for faithfulness, relevance, policy risk, hallucination, and overall quality
+- Types: `BasicEvaluationInput`, `BasicEvaluationScores`
+
+**Evaluation Dimensions**:
+- **Faithfulness**: How well the answer matches retrieved context
+- **Relevance**: How well the answer matches the query
+- **Policy Risk**: Detection of unsafe or non-compliant content
+- **Hallucination**: Likelihood of fabricated information
+- **Overall**: Weighted composite score (threshold: 0.75 for remediation)
+
+### `@traceforge/llm`
+
+LLM provider implementations with real Google Gemini integration.
+
+**Key exports**:
+- `GeminiProvider` - Real Google Gemini API integration
+- Automatic model fallback (gemini-2.5-flash → gemini-2.0-flash → gemini-1.5-pro)
+- Token usage tracking and cost calculation
+
+**Supported Models**:
+- `gemini-2.5-flash` (default, fast and cost-effective)
+- `gemini-2.0-flash` (fallback)
+- `gemini-1.5-pro` (fallback for complex tasks)
+- `gemini-pro` (legacy fallback)
+
+### `@traceforge/rag`
+
+RAG retrieval implementations with real Qdrant vector database integration.
+
+**Key exports**:
+- `QdrantRagProvider` - Real Qdrant integration for document retrieval
+- Keyword-based search (Phase 1.2, embeddings coming soon)
+- Automatic collection initialization and seeding
+
+**Features**:
+- Local Qdrant Docker setup
+- 20 pre-seeded demo documents
+- Keyword matching with relevance scoring
+- Top-K document retrieval
+
 ### Other Packages
 
-- **evaluator**: Quality scoring algorithms
-- **llm**: LLM provider abstractions (currently mocked, ready for real providers)
-- **rag**: RAG retrieval implementations (currently mocked, ready for real vector DBs)
-- **remediation**: Remediation strategy implementations
-- **tools**: Tool execution framework (currently mocked, ready for real tool integrations)
+- **remediation**: Remediation strategy implementations (CLARIFICATION currently implemented)
+- **tools**: Tool execution framework (mock implementations, ready for real integrations)
 
 ---
 
@@ -340,26 +470,72 @@ TraceForge is perfect for:
 
 ---
 
+## 📊 Observability
+
+TraceForge provides comprehensive observability out of the box:
+
+### Distributed Tracing
+
+Every request creates a complete trace with spans for:
+- `traceforge.request` - Root span for the entire request
+- `traceforge.rag` - RAG retrieval stage
+- `traceforge.tool` - Tool execution stage
+- `traceforge.llm` - LLM generation stage
+- `traceforge.evaluation` - Quality evaluation stage
+- `traceforge.remediation` - Remediation stage (if triggered)
+
+### Custom Metrics
+
+All metrics are exported to Datadog via OpenTelemetry:
+
+- **Request Metrics**: `traceforge.request.count`, `traceforge.request.latency_ms`, `traceforge.request.quality_ok`
+- **RAG Metrics**: `traceforge.rag.latency_ms`, `traceforge.rag.docs.count`
+- **LLM Metrics**: `traceforge.llm.latency_ms`, `traceforge.llm.tokens.input`, `traceforge.llm.tokens.output`, `traceforge.llm.cost.usd`
+- **Evaluation Metrics**: `traceforge.eval.score` (with dimension tags)
+- **Remediation Metrics**: `traceforge.remediation.triggered`
+- **Tool Metrics**: `traceforge.tool.calls`, `traceforge.tool.errors`
+
+### Service Level Objectives (SLOs)
+
+TraceForge includes built-in SLO tracking:
+
+- **Response Quality SLO**: Percentage of requests with `overall >= 0.75`
+- **P95 Latency SLO**: 95th percentile latency by remediation status
+
+See [METRICS_AND_SPANS.md](./METRICS_AND_SPANS.md) for complete documentation.
+
+---
+
 ## 🔮 Roadmap
 
-### Phase A (Current)
-- ✅ Core orchestration engine
-- ✅ OpenTelemetry integration
-- ✅ Mock implementations (RAG, LLM, Tools)
-- ✅ Basic evaluation and remediation
+### Phase 1.1: Core Observability ✅ COMPLETE
+- ✅ Real Gemini LLM provider integration
+- ✅ LLM tracing and metrics (latency, tokens, cost)
+- ✅ Evaluation system (faithfulness, relevance, policy risk, hallucination)
+- ✅ Remediation system (CLARIFICATION action)
+- ✅ OpenTelemetry integration with Datadog
 - ✅ Multi-tenant support
 
-### Phase B (Coming Soon)
-- 🔄 Real LLM provider integrations (OpenAI, Anthropic, Google)
-- 🔄 Real RAG implementations (Pinecone, Weaviate, Qdrant)
-- 🔄 Real tool integrations (custom tool execution)
-- 🔄 Advanced evaluation models (LLM-as-judge, embedding-based)
-- 🔄 Webhook support for external remediation
+### Phase 1.2: Real RAG Integration ✅ COMPLETE
+- ✅ Qdrant vector database setup
+- ✅ Real RAG provider with keyword search
+- ✅ RAG tracing and metrics
+- ✅ 20 pre-seeded demo documents
 
-### Phase C (Future)
+### Phase 2: Enhanced RAG (Coming Soon)
+- 🔄 Embedding-based semantic search
+- 🔄 Hybrid search (keyword + semantic)
+- 🔄 Reranking for better relevance
+- 🔄 Additional vector database support (Pinecone, Weaviate)
+
+### Phase 3: Advanced Features (Future)
+- 📋 Additional LLM providers (OpenAI, Anthropic)
+- 📋 Advanced evaluation models (LLM-as-judge, embedding-based)
+- 📋 Additional remediation strategies (SAFE_MODE, FALLBACK_TOOL, RETRY_LLM)
+- 📋 Real tool integrations (custom tool execution)
+- 📋 Webhook support for external remediation
 - 📋 Dashboard for observability visualization
 - 📋 Alerting and notification system
-- 📋 Advanced remediation strategies
 - 📋 A/B testing framework
 - 📋 Cost optimization recommendations
 
@@ -390,6 +566,13 @@ ISC License
 - Package management with [pnpm](https://pnpm.io/)
 
 ---
+
+## 📚 Additional Documentation
+
+- **[METRICS_AND_SPANS.md](./METRICS_AND_SPANS.md)**: Complete reference for all metrics and spans
+- **[RESPONSE_QUALITY_SLO.md](./RESPONSE_QUALITY_SLO.md)**: Guide for Response Quality SLO calculation
+- **[P95_LATENCY_QUERIES.md](./P95_LATENCY_QUERIES.md)**: P95 latency query examples
+- **[TOOL_NAMING_CONVENTION.md](./TOOL_NAMING_CONVENTION.md)**: Tool naming for SLO wildcard filtering
 
 ## 📞 Support
 
