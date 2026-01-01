@@ -66,6 +66,12 @@ import { TraceTagsInterceptor } from './telemetry/trace-tags.interceptor';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
 
+  // Serve static files for config UI
+  const express = require('express');
+  const path = require('path');
+  const staticPath = path.join(__dirname, '../public/config-ui');
+  app.use('/config', express.static(staticPath));
+
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
@@ -76,9 +82,16 @@ async function bootstrap() {
 
   app.useGlobalInterceptors(new TraceTagsInterceptor());
 
+  // Enable CORS for config UI
+  app.enableCors({
+    origin: true,
+    credentials: true,
+  });
+
   const port = process.env.PORT || 3000;
   await app.listen(port);
   console.log(`🚀 TraceForge API listening on port ${port}`);
+  console.log(`📝 Configuration UI available at http://localhost:${port}/config`);
 }
 
 bootstrap();

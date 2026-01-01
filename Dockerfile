@@ -21,7 +21,8 @@ RUN pnpm install --frozen-lockfile
 # Build shared workspace packages (only those with build scripts)
 # Build in dependency order: dependencies first, then dependents
 RUN pnpm --filter "@traceforge/telemetry" --filter "@traceforge/evaluator" \
-    --filter "@traceforge/rag" --filter "@traceforge/llm" run build
+    --filter "@traceforge/rag" --filter "@traceforge/llm" \
+    --filter "@traceforge/config" run build
 
 # Build core (depends on the above packages)
 RUN pnpm --filter "@traceforge/core" run build

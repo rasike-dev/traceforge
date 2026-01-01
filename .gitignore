@@ -132,3 +132,7 @@ TOOL_NAMING_CONVENTION.md
 # Demo/test scripts
 *.sh
 
+# Infrastructure configs with sensitive data
+cloud-run-service.yaml
+docker-compose.local.yml
+
