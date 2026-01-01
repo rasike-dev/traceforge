@@ -204,7 +204,7 @@ pnpm --filter api run start:dev
 ### Production Deployment
 
 **🌐 Live Production Service:**
-- **URL:** https://traceforge-api-oymutya24a-uc.a.run.app
+- **URL:** https://traceforge-api-894860605134.us-central1.run.app
 - **Platform:** Google Cloud Run (Serverless)
 - **Region:** us-central1
 - **Status:** ✅ Live and Operational
@@ -218,10 +218,10 @@ pnpm --filter api run start:dev
 **Test Production:**
 ```bash
 # Health check
-curl https://traceforge-api-oymutya24a-uc.a.run.app/health
+curl https://traceforge-api-894860605134.us-central1.run.app/health
 
 # Send a request
-curl -X POST https://traceforge-api-oymutya24a-uc.a.run.app/v1/ask \
+curl -X POST https://traceforge-api-894860605134.us-central1.run.app/v1/ask \
   -H "Content-Type: application/json" \
   -d '{"input": "What is observability?", "tenant": "production-test"}'
 ```
