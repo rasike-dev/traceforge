@@ -17,7 +17,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "packageManager": "pnpm@10.26.0",
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
