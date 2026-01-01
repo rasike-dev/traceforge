@@ -94,10 +94,11 @@ traceforge/
 - **Runtime**: Node.js with TypeScript
 - **Framework**: NestJS (for API layer)
 - **Build Tool**: tsup (for packages)
-- **Observability**: OpenTelemetry (traces + metrics) → Datadog
-- **LLM Provider**: Google Gemini (real API integration)
-- **Vector Database**: Qdrant (local Docker, keyword search)
+- **Observability**: OpenTelemetry SDK → OTLP → Datadog Agent (Sidecar) → Datadog Cloud
+- **LLM Provider**: Google Gemini (real API integration, gemini-2.5-flash)
+- **Vector Database**: Qdrant (keyword search, embeddings coming soon)
 - **Package Manager**: pnpm workspaces
+- **Deployment**: Google Cloud Run (Serverless)
 
 ---
 
@@ -168,11 +169,17 @@ pnpm tsx src/qdrant/seed.ts
 
 ```bash
 # Start Datadog Agent with OpenTelemetry receiver
-cd infra/datadog
-docker-compose up -d
+docker run -d \
+  --name traceforge-datadog-agent \
+  -e DD_API_KEY=your_datadog_api_key \
+  -e DD_SITE=datadoghq.com \
+  -e DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_HTTP_ENDPOINT=0.0.0.0:4318 \
+  -p 4318:4318 \
+  -p 8126:8126 \
+  gcr.io/datadoghq/agent:latest
 
-# Verify the agent is running
-docker-compose ps
+# Or use docker-compose (if available)
+docker-compose -f docker-compose.local.yml up -d
 ```
 
 **Note**: The Datadog Agent will receive traces and metrics on `localhost:4318` (OTLP endpoint).
@@ -180,14 +187,51 @@ docker-compose ps
 ### Running the API
 
 ```bash
-# Start the API server (development mode)
+# Set environment variables for OpenTelemetry
+export TELEMETRY_PROVIDER=opentelemetry
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+export OTEL_SERVICE_NAME=traceforge-api
+export OTEL_METRIC_EXPORT_INTERVAL_MS=5000
+
+# Start the API server (development mode)
 pnpm --filter api run start:dev
 
 # The API will be available at http://localhost:3000
 ```
 
 **Note**: Make sure Qdrant and Datadog Agent are running before starting the API.
+
+### Production Deployment
+
+**🌐 Live Production Service:**
+- **URL:** https://traceforge-api-oymutya24a-uc.a.run.app
+- **Platform:** Google Cloud Run (Serverless)
+- **Region:** us-central1
+- **Status:** ✅ Live and Operational
+
+**Architecture:**
+- OpenTelemetry SDK → OTLP (localhost:4318) → Datadog Agent Sidecar → Datadog Cloud
+- Real Gemini LLM integration (gemini-2.5-flash)
+- Real Qdrant RAG backend
+- Full observability (traces + metrics exported every 5 seconds)
+
+**Test Production:**
+```bash
+# Health check
+curl https://traceforge-api-oymutya24a-uc.a.run.app/health
+
+# Send a request
+curl -X POST https://traceforge-api-oymutya24a-uc.a.run.app/v1/ask \
+  -H "Content-Type: application/json" \
+  -d '{"input": "What is observability?", "tenant": "production-test"}'
+```
+
+**View Observability in Datadog:**
+- **APM Service:** https://app.datadoghq.com/apm/service/traceforge-api
+- **Environment:** `production`
+- **Filter:** `env:production`
+
+For detailed production information and judge submission details, see [JUDGE_SUBMISSION_INFO.md](./JUDGE_SUBMISSION_INFO.md).
 
 ---
 
@@ -407,10 +451,17 @@ The orchestration engine that coordinates RAG, tools, LLM, evaluation, and remed
 
 ### `@traceforge/telemetry`
 
-OpenTelemetry initialization and configuration. Sets up distributed tracing and metrics collection.
+OpenTelemetry initialization and configuration with vendor-neutral abstraction. Supports both Datadog native tracer and OpenTelemetry SDK.
 
 **Key exports**:
-- `initTelemetry()` - Initialize OpenTelemetry SDK
+- `initTelemetry()` - Initialize telemetry provider (auto-detects or uses TELEMETRY_PROVIDER)
+- Provider abstraction for switching between Datadog and OpenTelemetry
+
+**Features**:
+- Loosely coupled architecture (can switch observability vendors)
+- OpenTelemetry SDK with OTLP export
+- Automatic provider detection (DD_API_KEY → Datadog, else OpenTelemetry)
+- Continuous metrics export (configurable interval, default 5 seconds)
 
 ### `@traceforge/evaluator`
 
@@ -478,7 +529,26 @@ TraceForge is perfect for:
 
 ## 📊 Observability & Monitoring
 
-TraceForge provides comprehensive observability out of the box with pre-configured Datadog dashboards, monitors, and SLOs:
+TraceForge provides comprehensive observability out of the box with pre-configured Datadog dashboards, monitors, and SLOs. The system uses **OpenTelemetry SDK** with **OTLP protocol** for vendor-neutral observability, forwarding to Datadog via a sidecar agent pattern.
+
+### Observability Architecture
+
+**Local Development:**
+```
+TraceForge API → OTLP (localhost:4318) → Datadog Agent (Docker) → Datadog Cloud
+```
+
+**Production (Cloud Run):**
+```
+TraceForge API → OTLP (localhost:4318) → Datadog Agent (Sidecar) → Datadog Cloud
+```
+
+**Key Features:**
+- ✅ Vendor-neutral (OpenTelemetry SDK, not locked to Datadog)
+- ✅ Continuous metrics export (every 5 seconds)
+- ✅ Real-time trace export (on request completion)
+- ✅ Automatic provider detection
+- ✅ Can switch observability vendors by changing exporter endpoint
 
 ### Distributed Tracing
 
@@ -492,7 +562,7 @@ Every request creates a complete trace with spans for:
 
 ### Custom Metrics
 
-All metrics are exported to Datadog via OpenTelemetry:
+All metrics are exported to Datadog via OpenTelemetry OTLP protocol. Metrics are continuously pushed every 5 seconds (configurable via `OTEL_METRIC_EXPORT_INTERVAL_MS`):
 
 **Request Metrics**:
 - `traceforge.request.count` - Total requests handled
@@ -564,6 +634,13 @@ All SLO configurations are available in `datadog/slos.json` for easy import into
 - ✅ Comprehensive SLO tracking (9 SLOs: availability, latency, quality, tool reliability)
 - ✅ Pre-configured Datadog dashboards (4 dashboards)
 - ✅ Quality SLO metric tracking (`traceforge.request.quality_ok`)
+
+### Phase 1.4: Production Deployment ✅ COMPLETE
+- ✅ Google Cloud Run deployment with sidecar pattern
+- ✅ OpenTelemetry + Datadog Agent sidecar architecture
+- ✅ Continuous metrics export (every 5 seconds)
+- ✅ Real-time trace export to Datadog
+- ✅ Production service live and operational
 
 ### Phase 2: Enhanced RAG (Coming Soon)
 - 🔄 Embedding-based semantic search
@@ -641,7 +718,20 @@ TraceForge includes pre-configured Datadog resources for immediate observability
 
 For detailed monitoring and observability setup, see:
 - **Datadog Configuration**: All monitors, SLOs, and dashboards in `datadog/` directory
-- **Datadog Agent Setup**: `infra/datadog/docker-compose.yml` for local development
+- **Datadog Agent Setup**: `docker-compose.local.yml` for local development
+- **Production Deployment**: `cloud-run-service.yaml` for Cloud Run with sidecar
+- **Judge Submission Info**: `JUDGE_SUBMISSION_INFO.md` for production service details
+
+### Documentation Files
+
+- **[METRICS_AND_SPANS.md](./METRICS_AND_SPANS.md)** - Complete reference for all metrics and spans
+- **[RESPONSE_QUALITY_SLO.md](./RESPONSE_QUALITY_SLO.md)** - Response Quality SLO calculation guide
+- **[P95_LATENCY_QUERIES.md](./P95_LATENCY_QUERIES.md)** - P95 latency query examples
+- **[LLM_TOKEN_USAGE_QUERIES.md](./LLM_TOKEN_USAGE_QUERIES.md)** - LLM token usage calculation
+- **[LLM_TOKEN_SPIKE_EVENTS.md](./LLM_TOKEN_SPIKE_EVENTS.md)** - Token spike detection guide
+- **[PROMPT_VS_COMPLETION_TOKENS.md](./PROMPT_VS_COMPLETION_TOKENS.md)** - Token breakdown queries
+- **[TOOL_NAMING_CONVENTION.md](./TOOL_NAMING_CONVENTION.md)** - Tool naming for wildcard queries
+- **[JUDGE_SUBMISSION_INFO.md](./JUDGE_SUBMISSION_INFO.md)** - Production deployment information for judges
 
 ## 📞 Support
 

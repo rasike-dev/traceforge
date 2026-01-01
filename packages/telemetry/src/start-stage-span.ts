@@ -4,6 +4,7 @@ import { getSpanName } from './span-names';
 import { validateStageAttrs } from './span-attrs';
 import type { RagSpanAttrs, ToolSpanAttrs, LlmSpanAttrs, EvaluationSpanAttrs, RemediationSpanAttrs } from './span-attrs';
 
+// Use OpenTelemetry API directly - this is vendor-neutral and works with any OTLP-compatible backend
 const tracer = trace.getTracer('traceforge.core', '0.1.0');
 
 /**

@@ -1,0 +1,20 @@
+{
+	"id": 247749671,
+	"name": "TraceForge – AI Quality Degradation",
+	"type": "query alert",
+	"query": "avg(last_5m):avg:traceforge.eval.score{dimension:overall} < 0.75",
+	"message": "@incident-traceforge-quality\n - 🚨 TraceForge AI Quality Degradation Detected\n\nSignal\n- Metric: traceforge.eval.score{dimension:overall}\n- Current value: {{value}}\n- Threshold: {{threshold}}\n- Monitor state: {{alert_state}}\n\nImpact\n- AI response quality has degraded\n- Requests may be served in DEGRADED mode with CLARIFICATION remediation\n\nRunbook – Next steps for AI engineer\n1. Open the linked trace and inspect:\n   - traceforge.llm (tokens, latency, cost)\n   - traceforge.evaluation (faithfulness, relevance, hallucination)\n   - traceforge.remediation (action + reason)\n2. Check RAG document count (traceforge.rag.docs.count)\n3. If recurring, tune retrieval or prompt strategy\n4. If sudden spike, verify Gemini quota / latency\n\nContext\n- Application Health Dashboard: <PASTE DASHBOARD URL HERE>\n- Triggering Trace: {{link}}",
+	"tags": [],
+	"options": {
+		"thresholds": {
+			"critical": 0.75,
+			"critical_recovery": 0.8
+		},
+		"notify_audit": false,
+		"on_missing_data": "default",
+		"include_tags": false,
+		"new_host_delay": 300
+	},
+	"priority": null,
+	"draft_status": "published"
+}

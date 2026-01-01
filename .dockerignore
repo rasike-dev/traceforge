@@ -1,0 +1,57 @@
+# Dependencies
+node_modules
+**/node_modules
+
+# Build outputs (will be rebuilt in Docker)
+dist
+**/dist
+coverage
+**/coverage
+
+# Git
+.git
+.gitignore
+
+# Environment files (use Cloud Run secrets instead)
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+**/*.spec.ts
+**/*.test.ts
+**/test
+**/tests
+**/__tests__
+
+# Documentation (not needed in production)
+*.md
+!README.md
+
+# CI/CD
+.github
+.gitlab-ci.yml
+.travis.yml
+
+# Misc
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
