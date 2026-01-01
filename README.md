@@ -167,9 +167,15 @@ pnpm tsx src/qdrant/seed.ts
 3. **Start Datadog Agent** (for observability):
 
 ```bash
+# Start Datadog Agent with OpenTelemetry receiver
 cd infra/datadog
 docker-compose up -d
+
+# Verify the agent is running
+docker-compose ps
 ```
+
+**Note**: The Datadog Agent will receive traces and metrics on `localhost:4318` (OTLP endpoint).
 
 ### Running the API
 
@@ -470,9 +476,9 @@ TraceForge is perfect for:
 
 ---
 
-## 📊 Observability
+## 📊 Observability & Monitoring
 
-TraceForge provides comprehensive observability out of the box:
+TraceForge provides comprehensive observability out of the box with pre-configured Datadog dashboards, monitors, and SLOs:
 
 ### Distributed Tracing
 
@@ -488,21 +494,52 @@ Every request creates a complete trace with spans for:
 
 All metrics are exported to Datadog via OpenTelemetry:
 
-- **Request Metrics**: `traceforge.request.count`, `traceforge.request.latency_ms`, `traceforge.request.quality_ok`
-- **RAG Metrics**: `traceforge.rag.latency_ms`, `traceforge.rag.docs.count`
-- **LLM Metrics**: `traceforge.llm.latency_ms`, `traceforge.llm.tokens.input`, `traceforge.llm.tokens.output`, `traceforge.llm.cost.usd`
-- **Evaluation Metrics**: `traceforge.eval.score` (with dimension tags)
-- **Remediation Metrics**: `traceforge.remediation.triggered`
-- **Tool Metrics**: `traceforge.tool.calls`, `traceforge.tool.errors`
+**Request Metrics**:
+- `traceforge.request.count` - Total requests handled
+- `traceforge.request.latency_ms` - End-to-end request latency (histogram)
+- `traceforge.request.quality_ok` - Requests meeting quality threshold (≥ 0.75)
+
+**RAG Metrics**:
+- `traceforge.rag.latency_ms` - RAG retrieval latency (histogram)
+- `traceforge.rag.docs.count` - Number of documents retrieved (up/down counter)
+
+**LLM Metrics**:
+- `traceforge.llm.latency_ms` - LLM generation latency (histogram)
+- `traceforge.llm.tokens.input` - Input tokens consumed (counter)
+- `traceforge.llm.tokens.output` - Output tokens generated (counter)
+- `traceforge.llm.cost.usd` - Estimated cost in USD (counter)
+
+**Evaluation Metrics**:
+- `traceforge.eval.score` - Evaluation scores (up/down counter) with dimension tags: `faithfulness`, `relevance`, `policy_risk`, `hallucination`, `overall`
+
+**Remediation Metrics**:
+- `traceforge.remediation.triggered` - Remediation actions triggered (counter) with action tags: `CLARIFICATION`, `SAFE_MODE`, `FALLBACK_TOOL`, `RETRY_LLM`
+
+**Tool Metrics**:
+- `traceforge.tool.calls` - Successful tool calls (counter)
+- `traceforge.tool.errors` - Tool call errors (counter)
+- `traceforge.tool.latency_ms` - Tool execution latency (histogram)
 
 ### Service Level Objectives (SLOs)
 
-TraceForge includes built-in SLO tracking:
+TraceForge includes comprehensive SLO tracking with 9 pre-configured SLOs in Datadog:
 
-- **Response Quality SLO**: Percentage of requests with `overall >= 0.75`
-- **P95 Latency SLO**: 95th percentile latency by remediation status
+**Performance SLOs**:
+- **Request Availability** (7d, 99.5% target): Percentage of requests with status OK or DEGRADED
+- **Request Latency P95** (30d, 95% target): Time slices where p95 latency ≤ 2000ms
+- **Endpoint Latency** (7d, 99.9% target): P95 latency < 1s for `/v1/ask` route
 
-See [METRICS_AND_SPANS.md](./METRICS_AND_SPANS.md) for complete documentation.
+**Quality SLOs**:
+- **Response Quality** (30d, 95% target): Percentage of responses with overall quality score ≥ 0.75
+
+**Tool Reliability SLOs** (30d, 99% target each):
+- Tool Reliability for `weather*` tools
+- Tool Reliability for `search*` tools
+- Tool Reliability for `payment*` tools
+- Tool Reliability for `document_lookup*` tools
+- Tool Reliability for `vector_db*` tools
+
+All SLO configurations are available in `datadog/slos.json` for easy import into Datadog.
 
 ---
 
@@ -521,6 +558,12 @@ See [METRICS_AND_SPANS.md](./METRICS_AND_SPANS.md) for complete documentation.
 - ✅ Real RAG provider with keyword search
 - ✅ RAG tracing and metrics
 - ✅ 20 pre-seeded demo documents
+
+### Phase 1.3: Production Monitoring ✅ COMPLETE
+- ✅ Datadog monitors and alerts (cost, quality degradation)
+- ✅ Comprehensive SLO tracking (9 SLOs: availability, latency, quality, tool reliability)
+- ✅ Pre-configured Datadog dashboards (4 dashboards)
+- ✅ Quality SLO metric tracking (`traceforge.request.quality_ok`)
 
 ### Phase 2: Enhanced RAG (Coming Soon)
 - 🔄 Embedding-based semantic search
@@ -567,12 +610,36 @@ ISC License
 
 ---
 
-## 📚 Additional Documentation
+### Datadog Configuration
 
-- **[METRICS_AND_SPANS.md](./METRICS_AND_SPANS.md)**: Complete reference for all metrics and spans
-- **[RESPONSE_QUALITY_SLO.md](./RESPONSE_QUALITY_SLO.md)**: Guide for Response Quality SLO calculation
-- **[P95_LATENCY_QUERIES.md](./P95_LATENCY_QUERIES.md)**: P95 latency query examples
-- **[TOOL_NAMING_CONVENTION.md](./TOOL_NAMING_CONVENTION.md)**: Tool naming for SLO wildcard filtering
+TraceForge includes pre-configured Datadog resources for immediate observability:
+
+**Monitors** (`datadog/monitors.json`, `datadog/monitors1.json`):
+- **LLM Cost Alert**: Monitors average cost per request (warning: $0.02, critical: $0.05)
+- **AI Quality Degradation**: Alerts when overall quality score < 0.75
+
+**Dashboards** (`datadog/*.json`):
+- **LLM System Overview**: Request volume, latency, token usage, cost, tool metrics
+- **Cost & Token Economics**: Cost tracking by model, token usage breakdown
+- **Reliability & SLOs**: SLO status, error budgets, availability metrics
+- **TraceForensics**: Distributed tracing and span analysis
+
+**Import Instructions**:
+1. **Monitors**: Import via Datadog API or UI:
+   - `datadog/monitors.json` - LLM Cost Per Request alert
+   - `datadog/monitors1.json` - AI Quality Degradation alert
+2. **SLOs**: Import `datadog/slos.json` via Datadog SLO API (contains all 9 SLOs)
+3. **Dashboards**: Import dashboard JSON files via Datadog Dashboard API or UI
+
+**Monitor Details**:
+- **LLM Cost Monitor**: Alerts when average cost per request exceeds thresholds (warning: $0.02, critical: $0.05)
+- **Quality Degradation Monitor**: Alerts when overall evaluation score falls below 0.75 threshold
+
+## 📚 Additional Resources
+
+For detailed monitoring and observability setup, see:
+- **Datadog Configuration**: All monitors, SLOs, and dashboards in `datadog/` directory
+- **Datadog Agent Setup**: `infra/datadog/docker-compose.yml` for local development
 
 ## 📞 Support
 
